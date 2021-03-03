@@ -40,7 +40,7 @@ with open(os.path.join(this_directory, "README.md"), "r") as f:
 
 
 setuptools.setup(
-    name="flare-capa",
+    name="internal-flare-capa",
     version=__version__,
     description="The FLARE team's open-source tool to identify capabilities in executable files.",
     long_description=long_description,
