@@ -8,11 +8,11 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 import os
-import sys
 import os.path
 import binascii
 import contextlib
 import collections
+from functools import lru_cache
 
 import pytest
 
@@ -21,12 +21,6 @@ import capa.features.file
 import capa.features.insn
 import capa.features.basicblock
 from capa.features import ARCH_X32, ARCH_X64
-
-try:
-    from functools import lru_cache
-except ImportError:
-    from backports.functools_lru_cache import lru_cache
-
 
 CD = os.path.dirname(__file__)
 
@@ -41,11 +35,11 @@ def xfail(condition, reason=None):
     example::
 
         # this test:
-        #  - passes on py3 if foo() works
-        #  - fails  on py3 if foo() fails
-        #  - xfails on py2 if foo() fails
-        #  - fails  on py2 if foo() works
-        with xfail(sys.version_info < (3, 0), reason="py2 doesn't foo"):
+        #  - passes on Linux if foo() works
+        #  - fails  on Linux if foo() fails
+        #  - xfails on Windows if foo() fails
+        #  - fails  on Windows if foo() works
+        with xfail(sys.platform == "win32", reason="doesn't work on Windows"):
             foo()
     """
     try:
@@ -69,16 +63,25 @@ def xfail(condition, reason=None):
             raise RuntimeError("expected to fail, but didn't")
 
 
-@lru_cache()
+# need to limit cache size so GitHub Actions doesn't run out of memory, see #545
+@lru_cache(maxsize=6)
 def get_viv_extractor(path):
     import capa.features.extractors.viv
 
+    sigpaths = [
+        os.path.join(CD, "..", "sigs", "test_aulldiv.pat"),
+        os.path.join(CD, "..", "sigs", "test_aullrem.pat.gz"),
+        os.path.join(CD, "..", "sigs", "flare_common_libs.sig"),
+        os.path.join(CD, "..", "sigs", "flare_msvc_atlmfc_32_64.sig"),
+        os.path.join(CD, "..", "sigs", "flare_msvc_rtf_32_64.sig"),
+    ]
+
     if "raw32" in path:
-        vw = capa.main.get_workspace(path, "sc32", should_save=False)
+        vw = capa.main.get_workspace(path, "sc32", sigpaths=sigpaths)
     elif "raw64" in path:
-        vw = capa.main.get_workspace(path, "sc64", should_save=False)
+        vw = capa.main.get_workspace(path, "sc64", sigpaths=sigpaths)
     else:
-        vw = capa.main.get_workspace(path, "auto", should_save=True)
+        vw = capa.main.get_workspace(path, "auto", sigpaths=sigpaths)
     extractor = capa.features.extractors.viv.VivisectFeatureExtractor(vw, path)
     fixup_viv(path, extractor)
     return extractor
@@ -141,6 +144,7 @@ def extract_basic_block_features(extractor, f, bb):
     return features
 
 
+# note: too reduce the testing time it's recommended to reuse already existing test samples, if possible
 def get_data_path_by_name(name):
     if name == "mimikatz":
         return os.path.join(CD, "data", "mimikatz.exe_")
@@ -242,14 +246,14 @@ def sample(request):
 
 def get_function(extractor, fva):
     for f in extractor.get_functions():
-        if f.__int__() == fva:
+        if int(f) == fva:
             return f
     raise ValueError("function not found")
 
 
 def get_basic_block(extractor, f, va):
     for bb in extractor.get_basic_blocks(f):
-        if bb.__int__() == va:
+        if int(bb) == va:
             return bb
     raise ValueError("basic block not found")
 
@@ -469,8 +473,9 @@ FEATURE_PRESENCE_TESTS = [
     ("kernel32-64", "function=0x180001068", capa.features.Characteristic("cross section flow"), False),
     ("mimikatz", "function=0x4556E5", capa.features.Characteristic("cross section flow"), False),
     # insn/characteristic(recursive call)
-    ("39c05...", "function=0x10003100", capa.features.Characteristic("recursive call"), True),
-    ("mimikatz", "function=0x4556E5", capa.features.Characteristic("recursive call"), False),
+    ("mimikatz", "function=0x40640e", capa.features.Characteristic("recursive call"), True),
+    # before this we used ambiguous (0x4556E5, False), which has a data reference / indirect recursive call, see #386
+    ("mimikatz", "function=0x4175FF", capa.features.Characteristic("recursive call"), False),
     # insn/characteristic(indirect call)
     ("mimikatz", "function=0x4175FF", capa.features.Characteristic("indirect call"), True),
     ("mimikatz", "function=0x4556E5", capa.features.Characteristic("indirect call"), False),
@@ -479,7 +484,8 @@ FEATURE_PRESENCE_TESTS = [
     ("mimikatz", "function=0x4702FD", capa.features.Characteristic("calls from"), False),
     # function/characteristic(calls to)
     ("mimikatz", "function=0x40105D", capa.features.Characteristic("calls to"), True),
-    ("mimikatz", "function=0x4556E5", capa.features.Characteristic("calls to"), False),
+    # before this we used ambiguous (0x4556E5, False), which has a data reference / indirect recursive call, see #386
+    ("mimikatz", "function=0x456BB9", capa.features.Characteristic("calls to"), False),
 ]
 
 FEATURE_PRESENCE_TESTS_IDA = [
@@ -520,11 +526,7 @@ def do_test_feature_count(get_extractor, sample, scope, feature, expected):
 
 
 def get_extractor(path):
-    if sys.version_info >= (3, 0):
-        extractor = get_smda_extractor(path)
-    else:
-        extractor = get_viv_extractor(path)
-
+    extractor = get_viv_extractor(path)
     # overload the extractor so that the fixture exposes `extractor.path`
     setattr(extractor, "path", path)
     return extractor

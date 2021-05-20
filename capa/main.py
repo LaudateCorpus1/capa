@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 """
 Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -10,16 +10,20 @@ See the License for the specific language governing permissions and limitations 
 """
 import os
 import sys
+import gzip
+import time
 import hashlib
 import logging
 import os.path
 import argparse
 import datetime
 import textwrap
+import contextlib
 import collections
 
 import halo
 import tqdm
+import flirt
 import colorama
 
 import capa.rules
@@ -29,13 +33,25 @@ import capa.version
 import capa.features
 import capa.features.freeze
 import capa.features.extractors
-from capa.helpers import oint, get_file_taste
+from capa.helpers import get_file_taste
 
 RULES_PATH_DEFAULT_STRING = "(embedded rules)"
-SUPPORTED_FILE_MAGIC = set(["MZ"])
+SUPPORTED_FILE_MAGIC = set([b"MZ"])
+BACKEND_VIV = "vivisect"
+BACKEND_SMDA = "smda"
+EXTENSIONS_SHELLCODE_32 = ("sc32", "raw32")
+EXTENSIONS_SHELLCODE_64 = ("sc64", "raw64")
 
 
 logger = logging.getLogger("capa")
+
+
+@contextlib.contextmanager
+def timing(msg):
+    t0 = time.time()
+    yield
+    t1 = time.time()
+    logger.debug("perf: %s: %0.2fs", msg, t1 - t0)
 
 
 def set_vivisect_log_level(level):
@@ -72,14 +88,14 @@ def find_function_capabilities(ruleset, extractor, f):
                 bb_features[feature].add(va)
                 function_features[feature].add(va)
 
-        _, matches = capa.engine.match(ruleset.basic_block_rules, bb_features, oint(bb))
+        _, matches = capa.engine.match(ruleset.basic_block_rules, bb_features, int(bb))
 
         for rule_name, res in matches.items():
             bb_matches[rule_name].extend(res)
             for va, _ in res:
                 function_features[capa.features.MatchedRule(rule_name)].add(va)
 
-    _, function_matches = capa.engine.match(ruleset.function_rules, function_features, oint(f))
+    _, function_matches = capa.engine.match(ruleset.function_rules, function_features, int(f))
     return function_matches, bb_matches, len(function_features)
 
 
@@ -121,10 +137,19 @@ def find_capabilities(ruleset, extractor, disable_progress=None):
         # to disable progress completely
         pbar = lambda s, *args, **kwargs: s
 
-    for f in pbar(list(extractor.get_functions()), desc="matching", unit=" functions"):
+    functions = list(extractor.get_functions())
+
+    for f in pbar(functions, desc="matching", unit=" functions"):
+        function_address = int(f)
+
+        if extractor.is_library_function(function_address):
+            function_name = extractor.get_function_name(function_address)
+            logger.debug("skipping library function 0x%x (%s)", function_address, function_name)
+            continue
+
         function_matches, bb_matches, feature_count = find_function_capabilities(ruleset, extractor, f)
-        meta["feature_counts"]["functions"][f.__int__()] = feature_count
-        logger.debug("analyzed function 0x%x and extracted %d features", f.__int__(), feature_count)
+        meta["feature_counts"]["functions"][function_address] = feature_count
+        logger.debug("analyzed function 0x%x and extracted %d features", function_address, feature_count)
 
         for rule_name, res in function_matches.items():
             all_function_matches[rule_name].extend(res)
@@ -132,7 +157,7 @@ def find_capabilities(ruleset, extractor, disable_progress=None):
             all_bb_matches[rule_name].extend(res)
 
     # mapping from matched rule feature to set of addresses at which it matched.
-    # schema: Dic[MatchedRule: Set[int]
+    # schema: Dict[MatchedRule: Set[int]
     function_features = {
         capa.features.MatchedRule(rule_name): set(map(lambda p: p[0], results))
         for rule_name, results in all_function_matches.items()
@@ -225,26 +250,31 @@ def is_supported_file_type(sample):
 SHELLCODE_BASE = 0x690000
 
 
-def get_shellcode_vw(sample, arch="auto", should_save=True):
+def get_shellcode_vw(sample, arch="auto"):
     """
-    Return shellcode workspace using explicit arch or via auto detect
+    Return shellcode workspace using explicit arch or via auto detect.
+    The workspace is *not* analyzed nor saved. Its up to the caller to do this.
+    Then, they can register FLIRT analyzers or decide not to write to disk.
     """
     import viv_utils
 
     with open(sample, "rb") as f:
         sample_bytes = f.read()
+
     if arch == "auto":
         # choose arch with most functions, idea by Jay G.
         vw_cands = []
         for arch in ["i386", "amd64"]:
             vw_cands.append(
-                viv_utils.getShellcodeWorkspace(sample_bytes, arch, base=SHELLCODE_BASE, should_save=should_save)
+                viv_utils.getShellcodeWorkspace(
+                    sample_bytes, arch, base=SHELLCODE_BASE, analyze=False, should_save=False
+                )
             )
         if not vw_cands:
             raise ValueError("could not generate vivisect workspace")
         vw = max(vw_cands, key=lambda vw: len(vw.getFunctions()))
     else:
-        vw = viv_utils.getShellcodeWorkspace(sample_bytes, arch, base=SHELLCODE_BASE, should_save=should_save)
+        vw = viv_utils.getShellcodeWorkspace(sample_bytes, arch, base=SHELLCODE_BASE, analyze=False, should_save=False)
 
     vw.setMeta("StorageName", "%s.viv" % sample)
 
@@ -262,72 +292,158 @@ def get_meta_str(vw):
     return "%s, number of functions: %d" % (", ".join(meta), len(vw.getFunctions()))
 
 
+def load_flirt_signature(path):
+
+    if path.endswith(".sig"):
+        with open(path, "rb") as f:
+            with timing("flirt: parsing .sig: " + path):
+                sigs = flirt.parse_sig(f.read())
+
+    elif path.endswith(".pat"):
+        with open(path, "rb") as f:
+            with timing("flirt: parsing .pat: " + path):
+                sigs = flirt.parse_pat(f.read().decode("utf-8").replace("\r\n", "\n"))
+
+    elif path.endswith(".pat.gz"):
+        with gzip.open(path, "rb") as f:
+            with timing("flirt: parsing .pat.gz: " + path):
+                sigs = flirt.parse_pat(f.read().decode("utf-8").replace("\r\n", "\n"))
+
+    else:
+        raise ValueError("unexpect signature file extension: " + path)
+
+    return sigs
+
+
+def register_flirt_signature_analyzers(vw, sigpaths):
+    """
+    args:
+      vw (vivisect.VivWorkspace):
+      sigpaths (List[str]): file system paths of .sig/.pat files
+    """
+    import viv_utils.flirt
+
+    for sigpath in sigpaths:
+        sigs = load_flirt_signature(sigpath)
+
+        logger.debug("flirt: sig count: %d", len(sigs))
+
+        with timing("flirt: compiling sigs"):
+            matcher = flirt.compile(sigs)
+
+        analyzer = viv_utils.flirt.FlirtFunctionAnalyzer(matcher, sigpath)
+        logger.debug("registering viv function analyzer: %s", repr(analyzer))
+        viv_utils.flirt.addFlirtFunctionAnalyzer(vw, analyzer)
+
+
+def get_default_signatures():
+    if hasattr(sys, "frozen") and hasattr(sys, "_MEIPASS"):
+        logger.debug("detected running under PyInstaller")
+        sigs_path = os.path.join(sys._MEIPASS, "sigs")
+        logger.debug("default signatures path (PyInstaller method): %s", sigs_path)
+    else:
+        logger.debug("detected running from source")
+        sigs_path = os.path.join(os.path.dirname(__file__), "..", "sigs")
+        logger.debug("default signatures path (source method): %s", sigs_path)
+
+    ret = []
+    for root, dirs, files in os.walk(sigs_path):
+        for file in files:
+            if not (file.endswith(".pat") or file.endswith(".pat.gz") or file.endswith(".sig")):
+                continue
+
+            ret.append(os.path.join(root, file))
+
+    return ret
+
+
 class UnsupportedFormatError(ValueError):
     pass
 
 
-def get_workspace(path, format, should_save=True):
+def get_workspace(path, format, sigpaths):
+    """
+    load the program at the given path into a vivisect workspace using the given format.
+    also apply the given FLIRT signatures.
+
+    supported formats:
+      - pe
+      - sc32
+      - sc64
+      - auto
+
+    this creates and analyzes the workspace; however, it does *not* save the workspace.
+    this is the responsibility of the caller.
+    """
+
+    # lazy import enables us to not require viv if user wants SMDA, for example.
     import viv_utils
 
     logger.debug("generating vivisect workspace for: %s", path)
     if format == "auto":
         if not is_supported_file_type(path):
             raise UnsupportedFormatError()
-        vw = viv_utils.getWorkspace(path, should_save=should_save)
+
+        # don't analyze, so that we can add our Flirt function analyzer first.
+        vw = viv_utils.getWorkspace(path, analyze=False, should_save=False)
     elif format == "pe":
-        vw = viv_utils.getWorkspace(path, should_save=should_save)
+        vw = viv_utils.getWorkspace(path, analyze=False, should_save=False)
     elif format == "sc32":
-        vw = get_shellcode_vw(path, arch="i386", should_save=should_save)
+        # these are not analyzed nor saved.
+        vw = get_shellcode_vw(path, arch="i386")
     elif format == "sc64":
-        vw = get_shellcode_vw(path, arch="amd64", should_save=should_save)
+        vw = get_shellcode_vw(path, arch="amd64")
+    else:
+        raise ValueError("unexpected format: " + format)
+
+    register_flirt_signature_analyzers(vw, sigpaths)
+
+    vw.analyze()
+
     logger.debug("%s", get_meta_str(vw))
     return vw
-
-
-def get_extractor_py2(path, format, disable_progress=False):
-    import capa.features.extractors.viv
-
-    with halo.Halo(text="analyzing program", spinner="simpleDots", stream=sys.stderr, enabled=not disable_progress):
-        vw = get_workspace(path, format, should_save=False)
-
-        try:
-            vw.saveWorkspace()
-        except IOError:
-            # see #168 for discussion around how to handle non-writable directories
-            logger.info("source directory is not writable, won't save intermediate workspace")
-
-    return capa.features.extractors.viv.VivisectFeatureExtractor(vw, path)
 
 
 class UnsupportedRuntimeError(RuntimeError):
     pass
 
 
-def get_extractor_py3(path, format, disable_progress=False):
-    from smda.SmdaConfig import SmdaConfig
-    from smda.Disassembler import Disassembler
-
-    import capa.features.extractors.smda
-
-    smda_report = None
-    with halo.Halo(text="analyzing program", spinner="simpleDots", stream=sys.stderr, enabled=not disable_progress):
-        config = SmdaConfig()
-        config.STORE_BUFFER = True
-        smda_disasm = Disassembler(config)
-        smda_report = smda_disasm.disassembleFile(path)
-
-    return capa.features.extractors.smda.SmdaFeatureExtractor(smda_report, path)
-
-
-def get_extractor(path, format, disable_progress=False):
+def get_extractor(path, format, backend, sigpaths, disable_progress=False):
     """
     raises:
       UnsupportedFormatError:
     """
-    if sys.version_info >= (3, 0):
-        return get_extractor_py3(path, format, disable_progress=disable_progress)
+    if backend == "smda":
+        from smda.SmdaConfig import SmdaConfig
+        from smda.Disassembler import Disassembler
+
+        import capa.features.extractors.smda
+
+        smda_report = None
+        with halo.Halo(text="analyzing program", spinner="simpleDots", stream=sys.stderr, enabled=not disable_progress):
+            config = SmdaConfig()
+            config.STORE_BUFFER = True
+            smda_disasm = Disassembler(config)
+            smda_report = smda_disasm.disassembleFile(path)
+
+        return capa.features.extractors.smda.SmdaFeatureExtractor(smda_report, path)
     else:
-        return get_extractor_py2(path, format, disable_progress=disable_progress)
+        import capa.features.extractors.viv
+
+        with halo.Halo(text="analyzing program", spinner="simpleDots", stream=sys.stderr, enabled=not disable_progress):
+            if format == "auto" and path.endswith(EXTENSIONS_SHELLCODE_32):
+                format = "sc32"
+            elif format == "auto" and path.endswith(EXTENSIONS_SHELLCODE_64):
+                format = "sc64"
+            vw = get_workspace(path, format, sigpaths)
+
+            try:
+                vw.saveWorkspace()
+            except IOError:
+                # see #168 for discussion around how to handle non-writable directories
+                logger.info("source directory is not writable, won't save intermediate workspace")
+
+        return capa.features.extractors.viv.VivisectFeatureExtractor(vw, path)
 
 
 def is_nursery_rule_path(path):
@@ -361,8 +477,8 @@ def get_rules(rule_path, disable_progress=False):
 
             for file in files:
                 if not file.endswith(".yml"):
-                    if not (file.endswith(".md") or file.endswith(".git") or file.endswith(".txt")):
-                        # expect to see readme.md, format.md, and maybe a .git directory
+                    if not (file.startswith(".git") or file.endswith((".git", ".md", ".txt"))):
+                        # expect to see .git* files, readme.md, format.md, and maybe a .git directory
                         # other things maybe are rules, but are mis-named.
                         logger.warning("skipping non-.yml file: %s", file)
                     continue
@@ -428,18 +544,164 @@ def collect_metadata(argv, sample_path, rules_path, format, extractor):
     }
 
 
+def install_common_args(parser, wanted=None):
+    """
+    register a common set of command line arguments for re-use by main & scripts.
+    these are things like logging/coloring/etc.
+    also enable callers to opt-in to common arguments, like specifying the input sample.
+
+    this routine lets many script use the same language for cli arguments.
+    see `handle_common_args` to do common configuration.
+
+    args:
+      parser (argparse.ArgumentParser): a parser to update in place, adding common arguments.
+      wanted (Set[str]): collection of arguments to opt-into, including:
+        - "sample": required positional argument to input file.
+        - "format": flag to override file format.
+        - "backend": flag to override analysis backend.
+        - "rules": flag to override path to capa rules.
+        - "tag": flag to override/specify which rules to match.
+    """
+    if wanted is None:
+        wanted = set()
+
+    #
+    # common arguments that all scripts will have
+    #
+
+    parser.add_argument("--version", action="version", version="%(prog)s {:s}".format(capa.version.__version__))
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="enable verbose result document (no effect with --json)"
+    )
+    parser.add_argument(
+        "-vv", "--vverbose", action="store_true", help="enable very verbose result document (no effect with --json)"
+    )
+    parser.add_argument("-d", "--debug", action="store_true", help="enable debugging output on STDERR")
+    parser.add_argument("-q", "--quiet", action="store_true", help="disable all output but errors")
+    parser.add_argument(
+        "--color",
+        type=str,
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="enable ANSI color codes in results, default: only during interactive session",
+    )
+
+    #
+    # arguments that may be opted into:
+    #
+    #   - sample
+    #   - format
+    #   - rules
+    #   - tag
+    #
+
+    if "sample" in wanted:
+        parser.add_argument(
+            "sample",
+            type=str,
+            help="path to sample to analyze",
+        )
+
+    if "format" in wanted:
+        formats = [
+            ("auto", "(default) detect file type automatically"),
+            ("pe", "Windows PE file"),
+            ("sc32", "32-bit shellcode"),
+            ("sc64", "64-bit shellcode"),
+            ("freeze", "features previously frozen by capa"),
+        ]
+        format_help = ", ".join(["%s: %s" % (f[0], f[1]) for f in formats])
+        parser.add_argument(
+            "-f",
+            "--format",
+            choices=[f[0] for f in formats],
+            default="auto",
+            help="select sample format, %s" % format_help,
+        )
+
+        if "backend" in wanted:
+            parser.add_argument(
+                "-b",
+                "--backend",
+                type=str,
+                help="select the backend to use",
+                choices=(BACKEND_VIV, BACKEND_SMDA),
+                default=BACKEND_VIV,
+            )
+
+    if "rules" in wanted:
+        parser.add_argument(
+            "-r",
+            "--rules",
+            type=str,
+            default=RULES_PATH_DEFAULT_STRING,
+            help="path to rule file or directory, use embedded rules by default",
+        )
+
+    if "signatures" in wanted:
+        parser.add_argument(
+            "--signature",
+            action="append",
+            dest="signatures",
+            type=str,
+            # with action=append, users can specify futher signatures but not override whats found in $capa/sigs/.
+            # seems reasonable for now. this is an easy way to register the default signature set.
+            default=get_default_signatures(),
+            help="use the given signatures to identify library functions, file system paths to .sig/.pat files.",
+        )
+
+    if "tag" in wanted:
+        parser.add_argument("-t", "--tag", type=str, help="filter on rule meta field values")
+
+
+def handle_common_args(args):
+    """
+    handle the global config specified by `install_common_args`,
+    such as configuring logging/coloring/etc.
+
+    args:
+      args (argparse.Namespace): parsed arguments that included at least `install_common_args` args.
+    """
+    if args.quiet:
+        logging.basicConfig(level=logging.WARNING)
+        logging.getLogger().setLevel(logging.WARNING)
+    elif args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+        logging.getLogger().setLevel(logging.INFO)
+
+    # disable vivisect-related logging, it's verbose and not relevant for capa users
+    set_vivisect_log_level(logging.CRITICAL)
+
+    # Since Python 3.8 cp65001 is an alias to utf_8, but not for Pyhton < 3.8
+    # TODO: remove this code when only supporting Python 3.8+
+    # https://stackoverflow.com/a/3259271/87207
+    import codecs
+
+    codecs.register(lambda name: codecs.lookup("utf-8") if name == "cp65001" else None)
+
+    if args.color == "always":
+        colorama.init(strip=False)
+    elif args.color == "auto":
+        # colorama will detect:
+        #  - when on Windows console, and fixup coloring, and
+        #  - when not an interactive session, and disable coloring
+        # renderers should use coloring and assume it will be stripped out if necessary.
+        colorama.init()
+    elif args.color == "never":
+        colorama.init(strip=True)
+    else:
+        raise RuntimeError("unexpected --color value: " + args.color)
+
+
 def main(argv=None):
+    if sys.version_info < (3, 6):
+        raise UnsupportedRuntimeError("This version of capa can only be used with Python 3.6+")
+
     if argv is None:
         argv = sys.argv[1:]
-
-    formats = [
-        ("auto", "(default) detect file type automatically"),
-        ("pe", "Windows PE file"),
-        ("sc32", "32-bit shellcode"),
-        ("sc64", "64-bit shellcode"),
-        ("freeze", "features previously frozen by capa"),
-    ]
-    format_help = ", ".join(["%s: %s" % (f[0], f[1]) for f in formats])
 
     desc = "The FLARE team's open-source tool to identify capabilities in executable files."
     epilog = textwrap.dedent(
@@ -473,65 +735,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=desc, epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
-    if sys.version_info >= (3, 0):
-        parser.add_argument(
-            # Python 3 str handles non-ASCII arguments correctly
-            "sample",
-            type=str,
-            help="path to sample to analyze",
-        )
-    else:
-        parser.add_argument(
-            # in #328 we noticed that the sample path is not handled correctly if it contains non-ASCII characters
-            # https://stackoverflow.com/a/22947334/ offers a solution and decoding using getfilesystemencoding works
-            # in our testing, however other sources suggest `sys.stdin.encoding` (https://stackoverflow.com/q/4012571/)
-            "sample",
-            type=lambda s: s.decode(sys.getfilesystemencoding()),
-            help="path to sample to analyze",
-        )
-    parser.add_argument("--version", action="version", version="%(prog)s {:s}".format(capa.version.__version__))
-    parser.add_argument(
-        "-r",
-        "--rules",
-        type=str,
-        default=RULES_PATH_DEFAULT_STRING,
-        help="path to rule file or directory, use embedded rules by default",
-    )
-    parser.add_argument(
-        "-f", "--format", choices=[f[0] for f in formats], default="auto", help="select sample format, %s" % format_help
-    )
-    parser.add_argument("-t", "--tag", type=str, help="filter on rule meta field values")
+    install_common_args(parser, {"sample", "format", "backend", "signatures", "rules", "tag"})
     parser.add_argument("-j", "--json", action="store_true", help="emit JSON instead of text")
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="enable verbose result document (no effect with --json)"
-    )
-    parser.add_argument(
-        "-vv", "--vverbose", action="store_true", help="enable very verbose result document (no effect with --json)"
-    )
-    parser.add_argument("-d", "--debug", action="store_true", help="enable debugging output on STDERR")
-    parser.add_argument("-q", "--quiet", action="store_true", help="disable all output but errors")
-    parser.add_argument(
-        "--color",
-        type=str,
-        choices=("auto", "always", "never"),
-        default="auto",
-        help="enable ANSI color codes in results, default: only during interactive session",
-    )
     args = parser.parse_args(args=argv)
-
-    if args.quiet:
-        logging.basicConfig(level=logging.WARNING)
-        logging.getLogger().setLevel(logging.WARNING)
-    elif args.debug:
-        logging.basicConfig(level=logging.DEBUG)
-        logging.getLogger().setLevel(logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
-        logging.getLogger().setLevel(logging.INFO)
-
-    # disable vivisect-related logging, it's verbose and not relevant for capa users
-    set_vivisect_log_level(logging.CRITICAL)
+    handle_common_args(args)
 
     try:
         taste = get_file_taste(args.sample)
@@ -540,14 +747,6 @@ def main(argv=None):
         # handle the IOError separately and reach into the args
         logger.error("%s", e.args[0])
         return -1
-
-    # py2 doesn't know about cp65001, which is a variant of utf-8 on windows
-    # tqdm bails when trying to render the progress bar in this setup.
-    # because cp65001 is utf-8, we just map that codepage to the utf-8 codec.
-    # see #380 and: https://stackoverflow.com/a/3259271/87207
-    import codecs
-
-    codecs.register(lambda name: codecs.lookup("utf-8") if name == "cp65001" else None)
 
     if args.rules == RULES_PATH_DEFAULT_STRING:
         logger.debug("-" * 80)
@@ -605,7 +804,7 @@ def main(argv=None):
     else:
         format = args.format
         try:
-            extractor = get_extractor(args.sample, args.format, disable_progress=args.quiet)
+            extractor = get_extractor(args.sample, format, args.backend, args.signatures, disable_progress=args.quiet)
         except UnsupportedFormatError:
             logger.error("-" * 80)
             logger.error(" Input file does not appear to be a PE file.")
@@ -614,16 +813,6 @@ def main(argv=None):
                 " capa currently only supports analyzing PE files (or shellcode, when using --format sc32|sc64)."
             )
             logger.error(" If you don't know the input file type, you can try using the `file` utility to guess it.")
-            logger.error("-" * 80)
-            return -1
-        except UnsupportedRuntimeError:
-            logger.error("-" * 80)
-            logger.error(" Unsupported runtime or Python interpreter.")
-            logger.error(" ")
-            logger.error(" capa supports running under Python 2.7 using Vivisect for binary analysis.")
-            logger.error(" It can also run within IDA Pro, using either Python 2.7 or 3.5+.")
-            logger.error(" ")
-            logger.error(" If you're seeing this message on the command line, please ensure you're running Python 2.7.")
             logger.error("-" * 80)
             return -1
 
@@ -637,19 +826,6 @@ def main(argv=None):
         # do show the output in verbose mode, though.
         if not (args.verbose or args.vverbose or args.json):
             return -1
-
-    if args.color == "always":
-        colorama.init(strip=False)
-    elif args.color == "auto":
-        # colorama will detect:
-        #  - when on Windows console, and fixup coloring, and
-        #  - when not an interactive session, and disable coloring
-        # renderers should use coloring and assume it will be stripped out if necessary.
-        colorama.init()
-    elif args.color == "never":
-        colorama.init(strip=True)
-    else:
-        raise RuntimeError("unexpected --color value: " + args.color)
 
     if args.json:
         print(capa.render.render_json(meta, rules, capabilities))

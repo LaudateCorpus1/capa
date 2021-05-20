@@ -83,6 +83,7 @@ def test_rule_descriptions():
                 description: string description
               - string: '/myregex/'
                 description: regex description
+              - mnemonic: inc = mnemonic description
               # TODO - count(number(2 = number description)): 2
               - or:
                 - description: or description
@@ -104,6 +105,8 @@ def test_rule_descriptions():
             for child in statement.get_children():
                 rec(child)
         else:
+            if isinstance(statement.value, str):
+                assert "description" not in statement.value
             assert statement.description == statement.name + " description"
 
     rec(r.statement)
@@ -679,6 +682,25 @@ def test_explicit_string_values_int():
     children = list(r.statement.get_children())
     assert (String("123") in children) == True
     assert (String("0x123") in children) == True
+
+
+def test_string_values_special_characters():
+    rule = textwrap.dedent(
+        """
+        rule:
+            meta:
+                name: test rule
+            features:
+                - or:
+                    - string: "hello\\r\\nworld"
+                    - string: "bye\\nbye"
+                      description: "test description"
+        """
+    )
+    r = capa.rules.Rule.from_yaml(rule)
+    children = list(r.statement.get_children())
+    assert (String("hello\r\nworld") in children) == True
+    assert (String("bye\nbye") in children) == True
 
 
 def test_regex_values_always_string():

@@ -6,6 +6,7 @@ import collections
 import capa.main
 import capa.rules
 import capa.engine
+import capa.render
 import capa.features
 import capa.render.utils as rutils
 from capa.engine import *
@@ -191,7 +192,7 @@ def render_dictionary(doc):
 def capa_details(file_path, output_format="dictionary"):
 
     # extract features and find capabilities
-    extractor = capa.main.get_extractor(file_path, "auto", disable_progress=True)
+    extractor = capa.main.get_extractor(file_path, "auto", capa.main.BACKEND_VIV, sigpaths=[], disable_progress=True)
     capabilities, counts = capa.main.find_capabilities(rules, extractor, disable_progress=True)
 
     # collect metadata (used only to make rendering more complete)

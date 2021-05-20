@@ -25,13 +25,15 @@ import argparse
 import itertools
 import posixpath
 
+import ruamel.yaml
+
 import capa.main
 import capa.rules
 import capa.engine
 import capa.features
 import capa.features.insn
 
-logger = logging.getLogger("capa.lint")
+logger = logging.getLogger("lint")
 
 
 class Lint(object):
@@ -179,6 +181,9 @@ class ExampleFileDNE(Lint):
         return not found
 
 
+DEFAULT_SIGNATURES = capa.main.get_default_signatures()
+
+
 class DoesntMatchExample(Lint):
     name = "doesn't match on referenced example"
     recommendation = "Fix the rule logic or provide a different example"
@@ -201,7 +206,9 @@ class DoesntMatchExample(Lint):
                 continue
 
             try:
-                extractor = capa.main.get_extractor(path, "auto", disable_progress=True)
+                extractor = capa.main.get_extractor(
+                    path, "auto", capa.main.BACKEND_VIV, sigpaths=DEFAULT_SIGNATURES, disable_progress=True
+                )
                 capabilities, meta = capa.main.find_capabilities(ctx["rules"], extractor, disable_progress=True)
             except Exception as e:
                 logger.error("failed to extract capabilities: %s %s %s", rule.name, path, e)
@@ -301,6 +308,16 @@ class FeatureNtdllNtoskrnlApi(Lint):
         return False
 
 
+class FormatLineFeedEOL(Lint):
+    name = "line(s) end with CRLF (\\r\\n)"
+    recommendation = "convert line endings to LF (\\n) for example using dos2unix"
+
+    def check_rule(self, ctx, rule):
+        if len(rule.definition.split("\r\n")) > 0:
+            return False
+        return True
+
+
 class FormatSingleEmptyLineEOF(Lint):
     name = "EOF format"
     recommendation = "end file with a single empty line"
@@ -320,10 +337,41 @@ class FormatIncorrect(Lint):
         expected = capa.rules.Rule.from_yaml(rule.definition, use_ruamel=True).to_yaml()
 
         if actual != expected:
-            diff = difflib.ndiff(actual.splitlines(1), expected.splitlines(1))
-            self.recommendation = self.recommendation_template.format("".join(diff))
+            diff = difflib.ndiff(actual.splitlines(1), expected.splitlines(True))
+            recommendation_template = self.recommendation_template
+            if "\r\n" in actual:
+                recommendation_template = (
+                    self.recommendation_template + "\nplease make sure that the file uses LF (\\n) line endings only"
+                )
+            self.recommendation = recommendation_template.format("".join(diff))
             return True
 
+        return False
+
+
+class FormatStringQuotesIncorrect(Lint):
+    name = "rule string quotes incorrect"
+
+    def check_rule(self, ctx, rule):
+        events = capa.rules.Rule._get_ruamel_yaml_parser().parse(rule.definition)
+        for key in events:
+            if not (isinstance(key, ruamel.yaml.ScalarEvent) and key.value == "string"):
+                continue
+            value = next(events)  # assume value is next event
+            if not isinstance(value, ruamel.yaml.ScalarEvent):
+                # ignore non-scalar
+                continue
+            if value.value.startswith("/") and value.value.endswith(("/", "/i")):
+                # ignore regex for now
+                continue
+            if value.style is None:
+                # no quotes
+                self.recommendation = 'add double quotes to "%s"' % value.value
+                return True
+            if value.style == "'":
+                # single quote
+                self.recommendation = 'change single quotes to double quotes for "%s"' % value.value
+                return True
         return False
 
 
@@ -385,7 +433,9 @@ def lint_features(ctx, rule):
 
 
 FORMAT_LINTS = (
+    FormatLineFeedEOL(),
     FormatSingleEmptyLineEOF(),
+    FormatStringQuotesIncorrect(),
     FormatIncorrect(),
 )
 
@@ -554,7 +604,8 @@ def main(argv=None):
 
     samples_path = os.path.join(os.path.dirname(__file__), "..", "tests", "data")
 
-    parser = argparse.ArgumentParser(description="A program.")
+    parser = argparse.ArgumentParser(description="Lint capa rules.")
+    capa.main.install_common_args(parser, wanted={"tag"})
     parser.add_argument("rules", type=str, help="Path to rules")
     parser.add_argument("--samples", type=str, default=samples_path, help="Path to samples")
     parser.add_argument(
@@ -562,24 +613,15 @@ def main(argv=None):
         action="store_true",
         help="Enable thorough linting - takes more time, but does a better job",
     )
-    parser.add_argument("-t", "--tag", type=str, help="filter on rule meta field values")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Disable all output but errors")
     args = parser.parse_args(args=argv)
+    capa.main.handle_common_args(args)
 
-    if args.verbose:
-        level = logging.DEBUG
-    elif args.quiet:
-        level = logging.ERROR
+    if args.debug:
+        logging.getLogger("capa").setLevel(logging.DEBUG)
+        logging.getLogger("viv_utils").setLevel(logging.DEBUG)
     else:
-        level = logging.INFO
-
-    logging.basicConfig(level=level)
-    logging.getLogger("capa.lint").setLevel(level)
-
-    capa.main.set_vivisect_log_level(logging.CRITICAL)
-    logging.getLogger("capa").setLevel(logging.CRITICAL)
-    logging.getLogger("viv_utils").setLevel(logging.CRITICAL)
+        logging.getLogger("capa").setLevel(logging.ERROR)
+        logging.getLogger("viv_utils").setLevel(logging.ERROR)
 
     time0 = time.time()
 
