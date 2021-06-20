@@ -44,7 +44,7 @@ from capa.helpers import get_file_taste
 from capa.features.extractors.base_extractor import FunctionHandle, FeatureExtractor
 
 RULES_PATH_DEFAULT_STRING = "(embedded rules)"
-SUPPORTED_FILE_MAGIC = set([b"MZ"])
+SUPPORTED_FILE_MAGIC = {b"MZ", b"\x7fE"}
 BACKEND_VIV = "vivisect"
 BACKEND_SMDA = "smda"
 EXTENSIONS_SHELLCODE_32 = ("sc32", "raw32")
@@ -409,7 +409,7 @@ def get_workspace(path, format, sigpaths):
 
         # don't analyze, so that we can add our Flirt function analyzer first.
         vw = viv_utils.getWorkspace(path, analyze=False, should_save=False)
-    elif format == "pe":
+    elif format in {"pe", "elf"}:
         vw = viv_utils.getWorkspace(path, analyze=False, should_save=False)
     elif format == "sc32":
         # these are not analyzed nor saved.
@@ -635,6 +635,7 @@ def install_common_args(parser, wanted=None):
         formats = [
             ("auto", "(default) detect file type automatically"),
             ("pe", "Windows PE file"),
+            ("elf", "Executable and Linkable Format"),
             ("sc32", "32-bit shellcode"),
             ("sc64", "64-bit shellcode"),
             ("freeze", "features previously frozen by capa"),
