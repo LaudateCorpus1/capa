@@ -86,6 +86,9 @@ def get_printable_len(instr):
     if len(instr.operands) != 2:
         return 0
 
+    if not instr.imm_size:
+        return 0
+
     op_value = instr.operands[1].value.imm
 
     if instr.imm_size == 1:
