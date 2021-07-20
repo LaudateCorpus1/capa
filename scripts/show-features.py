@@ -64,8 +64,10 @@ Example::
     insn: 0x10001027: mnemonic(shl)
     ...
 """
+import os
 import sys
 import logging
+import os.path
 import argparse
 
 import capa.main
@@ -95,13 +97,20 @@ def main(argv=None):
         logger.error("%s", str(e))
         return -1
 
+    try:
+        sig_paths = capa.main.get_signatures(args.signatures)
+    except (IOError) as e:
+        logger.error("%s", str(e))
+        return -1
+
     if (args.format == "freeze") or (args.format == "auto" and capa.features.freeze.is_freeze(taste)):
         with open(args.sample, "rb") as f:
             extractor = capa.features.freeze.load(f.read())
     else:
+        should_save_workspace = os.environ.get("CAPA_SAVE_WORKSPACE") not in ("0", "no", "NO", "n", None)
         try:
             extractor = capa.main.get_extractor(
-                args.sample, args.format, capa.main.BACKEND_VIV, sigpaths=args.signatures
+                args.sample, args.format, capa.main.BACKEND_VIV, sig_paths, should_save_workspace
             )
         except capa.main.UnsupportedFormatError:
             logger.error("-" * 80)
@@ -153,10 +162,14 @@ def main(argv=None):
 
 
 def ida_main():
+    import idc
+
+    import capa.features.extractors.ida.extractor
+
     function = idc.get_func_attr(idc.here(), idc.FUNCATTR_START)
     print("getting features for current function 0x%X" % function)
 
-    extractor = capa.features.extractors.ida.IdaFeatureExtractor()
+    extractor = capa.features.extractors.ida.extractor.IdaFeatureExtractor()
 
     if not function:
         for feature, va in extractor.extract_file_features():
@@ -182,6 +195,13 @@ def ida_main():
 
 def print_features(functions, extractor):
     for f in functions:
+        function_address = int(f)
+
+        if extractor.is_library_function(function_address):
+            function_name = extractor.get_function_name(function_address)
+            logger.debug("skipping library function 0x%x (%s)", function_address, function_name)
+            continue
+
         for feature, va in extractor.extract_function_features(f):
             print("func: 0x%08x: %s" % (va, feature))
 

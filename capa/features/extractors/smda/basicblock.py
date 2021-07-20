@@ -1,8 +1,7 @@
-import sys
 import string
 import struct
 
-from capa.features import Characteristic
+from capa.features.common import Characteristic
 from capa.features.basicblock import BasicBlock
 from capa.features.extractors.helpers import MIN_STACKSTRING_LEN
 
@@ -120,7 +119,7 @@ def extract_features(f, bb):
       bb (smda.common.SmdaBasicBlock): the basic block to process.
 
     yields:
-      Feature, set[VA]: the features and their location found in this basic block.
+      Tuple[Feature, int]: the features and their location found in this basic block.
     """
     yield BasicBlock(), bb.offset
     for bb_handler in BASIC_BLOCK_HANDLERS:

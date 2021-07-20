@@ -8,11 +8,23 @@
 
 import copy
 import collections
+from typing import Set, Dict, List, Tuple, Union, Mapping
 
-import capa.features
+import capa.rules
+import capa.features.common
+from capa.features.common import Feature
+
+# a collection of features and the locations at which they are found.
+#
+# used throughout matching as the context in which features are searched:
+# to check if a feature exists, do: `Number(0x10) in features`.
+# to collect the locations of a feature, do: `features[Number(0x10)]`
+#
+# aliased here so that the type can be documented and xref'd.
+FeatureSet = Dict[Feature, Set[int]]
 
 
-class Statement(object):
+class Statement:
     """
     superclass for structural nodes, such as and/or/not.
     this exists to provide a default impl for `__str__` and `__repr__`,
@@ -33,7 +45,7 @@ class Statement(object):
     def __repr__(self):
         return str(self)
 
-    def evaluate(self, ctx):
+    def evaluate(self, features: FeatureSet) -> "Result":
         """
         classes that inherit `Statement` must implement `evaluate`
 
@@ -50,7 +62,7 @@ class Statement(object):
             yield self.child
 
         if hasattr(self, "children"):
-            for child in self.children:
+            for child in getattr(self, "children"):
                 yield child
 
     def replace_child(self, existing, new):
@@ -59,12 +71,13 @@ class Statement(object):
                 self.child = new
 
         if hasattr(self, "children"):
-            for i, child in enumerate(self.children):
+            children = getattr(self, "children")
+            for i, child in enumerate(children):
                 if child is existing:
-                    self.children[i] = new
+                    children[i] = new
 
 
-class Result(object):
+class Result:
     """
     represents the results of an evaluation of statements against features.
 
@@ -78,7 +91,7 @@ class Result(object):
     we need this so that we can render the tree of expressions and their results.
     """
 
-    def __init__(self, success, statement, children, locations=None):
+    def __init__(self, success: bool, statement: Union[Statement, Feature], children: List["Result"], locations=None):
         """
         args:
           success (bool)
@@ -199,38 +212,23 @@ class Subscope(Statement):
         raise ValueError("cannot evaluate a subscope directly!")
 
 
-def topologically_order_rules(rules):
-    """
-    order the given rules such that dependencies show up before dependents.
-    this means that as we match rules, we can add features for the matches, and these
-     will be matched by subsequent rules if they follow this order.
-
-    assumes that the rule dependency graph is a DAG.
-    """
-    # we evaluate `rules` multiple times, so if its a generator, realize it into a list.
-    rules = list(rules)
-    namespaces = capa.rules.index_rules_by_namespace(rules)
-    rules = {rule.name: rule for rule in rules}
-    seen = set([])
-    ret = []
-
-    def rec(rule):
-        if rule.name in seen:
-            return
-
-        for dep in rule.get_dependencies(namespaces):
-            rec(rules[dep])
-
-        ret.append(rule)
-        seen.add(rule.name)
-
-    for rule in rules.values():
-        rec(rule)
-
-    return ret
+# mapping from rule name to list of: (location of match, result object)
+#
+# used throughout matching and rendering to collection the results
+#  of statement evaluation and their locations.
+#
+# to check if a rule matched, do: `"TCP client" in matches`.
+# to find where a rule matched, do: `map(first, matches["TCP client"])`
+# to see how a rule matched, do:
+#
+#     for address, match_details in matches["TCP client"]:
+#         inspect(match_details)
+#
+# aliased here so that the type can be documented and xref'd.
+MatchResults = Mapping[str, List[Tuple[int, Result]]]
 
 
-def match(rules, features, va):
+def match(rules: List["capa.rules.Rule"], features: FeatureSet, va: int) -> Tuple[FeatureSet, MatchResults]:
     """
     Args:
       rules (List[capa.rules.Rule]): these must already be ordered topologically by dependency.
@@ -238,11 +236,11 @@ def match(rules, features, va):
       va (int): location of the features
 
     Returns:
-      Tuple[List[capa.features.Feature], Dict[str, Tuple[int, capa.engine.Result]]]: two-tuple with entries:
-        - list of features used for matching (which may be greater than argument, due to rule match features), and
-        - mapping from rule name to (location of match, result object)
+      Tuple[FeatureSet, MatchResults]: two-tuple with entries:
+        - set of features used for matching (which may be greater than argument, due to rule match features), and
+        - mapping from rule name to [(location of match, result object)]
     """
-    results = collections.defaultdict(list)
+    results = collections.defaultdict(list)  # type: MatchResults
 
     # copy features so that we can modify it
     # without affecting the caller (keep this function pure)
@@ -254,12 +252,12 @@ def match(rules, features, va):
         res = rule.evaluate(features)
         if res:
             results[rule.name].append((va, res))
-            features[capa.features.MatchedRule(rule.name)].add(va)
+            features[capa.features.common.MatchedRule(rule.name)].add(va)
 
             namespace = rule.meta.get("namespace")
             if namespace:
                 while namespace:
-                    features[capa.features.MatchedRule(namespace)].add(va)
+                    features[capa.features.common.MatchedRule(namespace)].add(va)
                     namespace, _, _ = namespace.rpartition("/")
 
     return (features, results)

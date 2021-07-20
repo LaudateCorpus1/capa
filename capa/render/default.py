@@ -7,15 +7,20 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 import collections
+from typing import Dict, List
 
 import tabulate
 
 import capa.render.utils as rutils
+import capa.render.result_document
+from capa.rules import RuleSet
+from capa.engine import MatchResults
+from capa.render.utils import StringIO
 
 tabulate.PRESERVE_WHITESPACE = True
 
 
-def width(s, character_count):
+def width(s: str, character_count: int) -> str:
     """pad the given string to at least `character_count`"""
     if len(s) < character_count:
         return s + " " * (character_count - len(s))
@@ -23,7 +28,7 @@ def width(s, character_count):
         return s
 
 
-def render_meta(doc, ostream):
+def render_meta(doc, ostream: StringIO):
     rows = [
         (width("md5", 22), width(doc["meta"]["sample"]["md5"], 82)),
         ("sha1", doc["meta"]["sample"]["sha1"]),
@@ -63,7 +68,7 @@ def find_subrule_matches(doc):
     return matches
 
 
-def render_capabilities(doc, ostream):
+def render_capabilities(doc, ostream: StringIO):
     """
     example::
 
@@ -101,7 +106,7 @@ def render_capabilities(doc, ostream):
         ostream.writeln(rutils.bold("no capabilities found"))
 
 
-def render_attack(doc, ostream):
+def render_attack(doc, ostream: StringIO):
     """
     example::
 
@@ -123,27 +128,16 @@ def render_attack(doc, ostream):
             continue
 
         for attack in rule["meta"]["att&ck"]:
-            tactic, _, rest = attack.partition("::")
-            if "::" in rest:
-                technique, _, rest = rest.partition("::")
-                subtechnique, _, id = rest.rpartition(" ")
-                tactics[tactic].add((technique, subtechnique, id))
-            else:
-                technique, _, id = rest.rpartition(" ")
-                tactics[tactic].add((technique, id))
+            tactics[attack["tactic"]].add((attack["technique"], attack.get("subtechnique"), attack["id"]))
 
     rows = []
     for tactic, techniques in sorted(tactics.items()):
         inner_rows = []
-        for spec in sorted(techniques):
-            if len(spec) == 2:
-                technique, id = spec
+        for (technique, subtechnique, id) in sorted(techniques):
+            if subtechnique is None:
                 inner_rows.append("%s %s" % (rutils.bold(technique), id))
-            elif len(spec) == 3:
-                technique, subtechnique, id = spec
-                inner_rows.append("%s::%s %s" % (rutils.bold(technique), subtechnique, id))
             else:
-                raise RuntimeError("unexpected ATT&CK spec format")
+                inner_rows.append("%s::%s %s" % (rutils.bold(technique), subtechnique, id))
         rows.append(
             (
                 rutils.bold(tactic.upper()),
@@ -160,7 +154,7 @@ def render_attack(doc, ostream):
         ostream.write("\n")
 
 
-def render_mbc(doc, ostream):
+def render_mbc(doc, ostream: StringIO):
     """
     example::
 
@@ -179,32 +173,17 @@ def render_mbc(doc, ostream):
         if not rule["meta"].get("mbc"):
             continue
 
-        mbcs = rule["meta"]["mbc"]
-        if not isinstance(mbcs, list):
-            raise ValueError("invalid rule: MBC mapping is not a list")
-
-        for mbc in mbcs:
-            objective, _, rest = mbc.partition("::")
-            if "::" in rest:
-                behavior, _, rest = rest.partition("::")
-                method, _, id = rest.rpartition(" ")
-                objectives[objective].add((behavior, method, id))
-            else:
-                behavior, _, id = rest.rpartition(" ")
-                objectives[objective].add((behavior, id))
+        for mbc in rule["meta"]["mbc"]:
+            objectives[mbc["objective"]].add((mbc["behavior"], mbc.get("method"), mbc["id"]))
 
     rows = []
     for objective, behaviors in sorted(objectives.items()):
         inner_rows = []
-        for spec in sorted(behaviors):
-            if len(spec) == 2:
-                behavior, id = spec
-                inner_rows.append("%s %s" % (rutils.bold(behavior), id))
-            elif len(spec) == 3:
-                behavior, method, id = spec
-                inner_rows.append("%s::%s %s" % (rutils.bold(behavior), method, id))
+        for (behavior, method, id) in sorted(behaviors):
+            if method is None:
+                inner_rows.append("%s [%s]" % (rutils.bold(behavior), id))
             else:
-                raise RuntimeError("unexpected MBC spec format")
+                inner_rows.append("%s::%s [%s]" % (rutils.bold(behavior), method, id))
         rows.append(
             (
                 rutils.bold(objective.upper()),
@@ -231,3 +210,8 @@ def render_default(doc):
     render_capabilities(doc, ostream)
 
     return ostream.getvalue()
+
+
+def render(meta, rules: RuleSet, capabilities: MatchResults) -> str:
+    doc = capa.render.result_document.convert_capabilities_to_result_document(meta, rules, capabilities)
+    return render_default(doc)

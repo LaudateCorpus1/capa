@@ -25,20 +25,33 @@ import argparse
 import itertools
 import posixpath
 
+import termcolor
 import ruamel.yaml
 
 import capa.main
 import capa.rules
 import capa.engine
-import capa.features
 import capa.features.insn
+import capa.features.common
 
 logger = logging.getLogger("lint")
 
 
-class Lint(object):
-    WARN = "WARN"
-    FAIL = "FAIL"
+def red(s):
+    return termcolor.colored(s, "red")
+
+
+def orange(s):
+    return termcolor.colored(s, "yellow")
+
+
+def green(s):
+    return termcolor.colored(s, "green")
+
+
+class Lint:
+    WARN = orange("WARN")
+    FAIL = red("FAIL")
 
     name = "lint"
     level = FAIL
@@ -207,7 +220,7 @@ class DoesntMatchExample(Lint):
 
             try:
                 extractor = capa.main.get_extractor(
-                    path, "auto", capa.main.BACKEND_VIV, sigpaths=DEFAULT_SIGNATURES, disable_progress=True
+                    path, "auto", capa.main.BACKEND_VIV, DEFAULT_SIGNATURES, False, disable_progress=True
                 )
                 capabilities, meta = capa.main.find_capabilities(ctx["rules"], extractor, disable_progress=True)
             except Exception as e:
@@ -216,6 +229,53 @@ class DoesntMatchExample(Lint):
 
             if rule.name not in capabilities:
                 return True
+
+
+class StatementWithSingleChildStatement(Lint):
+    name = "rule contains one or more statements with a single child statement"
+    recommendation = "remove the superfluous parent statement"
+    recommendation_template = "remove the superfluous parent statement: {:s}"
+    violation = False
+
+    def check_rule(self, ctx, rule):
+        self.violation = False
+
+        def rec(statement, is_root=False):
+            if isinstance(statement, (capa.engine.And, capa.engine.Or)):
+                children = list(statement.get_children())
+                if not is_root and len(children) == 1 and isinstance(children[0], capa.engine.Statement):
+                    self.recommendation = self.recommendation_template.format(str(statement))
+                    self.violation = True
+                for child in children:
+                    rec(child)
+
+        rec(rule.statement, is_root=True)
+
+        return self.violation
+
+
+class OrStatementWithAlwaysTrueChild(Lint):
+    name = "rule contains an `or` statement that's always True because of an `optional` or other child statement that's always True"
+    recommendation = "clarify the rule logic, e.g. by moving the always True child statement"
+    recommendation_template = "clarify the rule logic, e.g. by moving the always True child statement: {:s}"
+    violation = False
+
+    def check_rule(self, ctx, rule):
+        self.violation = False
+
+        def rec(statement):
+            if isinstance(statement, capa.engine.Or):
+                children = list(statement.get_children())
+                for child in children:
+                    # `Some` implements `optional` which is an alias for `0 or more`
+                    if isinstance(child, capa.engine.Some) and child.count == 0:
+                        self.recommendation = self.recommendation_template.format(str(child))
+                        self.violation = True
+                    rec(child)
+
+        rec(rule.statement)
+
+        return self.violation
 
 
 class UnusualMetaField(Lint):
@@ -266,7 +326,7 @@ class FeatureStringTooShort(Lint):
 
     def check_features(self, ctx, features):
         for feature in features:
-            if isinstance(feature, capa.features.String):
+            if isinstance(feature, capa.features.common.String):
                 if len(feature.value) < 4:
                     self.recommendation = self.recommendation.format(feature.value)
                     return True
@@ -451,7 +511,7 @@ def get_normpath(path):
 def get_features(ctx, rule):
     # get features from rule and all dependencies including subscopes and matched rules
     features = []
-    namespaces = capa.rules.index_rules_by_namespace([rule])
+    namespaces = ctx["rules"].rules_by_namespace
     deps = [ctx["rules"].rules[dep] for dep in rule.get_dependencies(namespaces)]
     for r in [rule] + deps:
         features.extend(get_rule_features(r))
@@ -472,7 +532,11 @@ def get_rule_features(rule):
     return features
 
 
-LOGIC_LINTS = (DoesntMatchExample(),)
+LOGIC_LINTS = (
+    DoesntMatchExample(),
+    StatementWithSingleChildStatement(),
+    OrStatementWithAlwaysTrueChild(),
+)
 
 
 def lint_logic(ctx, rule):
@@ -528,15 +592,37 @@ def lint_rule(ctx, rule):
 
         print("")
 
-    lints_failed = any(map(lambda v: v.level == Lint.FAIL, violations))
+    if is_nursery_rule(rule):
+        has_examples = not any(map(lambda v: v.level == Lint.FAIL and v.name == "missing examples", violations))
+        lints_failed = len(
+            tuple(
+                filter(
+                    lambda v: v.level == Lint.FAIL
+                    and not (v.name == "missing examples" or v.name == "referenced example doesn't exist"),
+                    violations,
+                )
+            )
+        )
+        lints_warned = len(
+            tuple(
+                filter(
+                    lambda v: v.level == Lint.WARN
+                    or (v.level == Lint.FAIL and v.name == "referenced example doesn't exist"),
+                    violations,
+                )
+            )
+        )
 
-    if not lints_failed and is_nursery_rule(rule):
-        print("")
-        print("%s%s" % ("    (nursery) ", rule.name))
-        print("%s  %s: %s: %s" % ("    ", Lint.WARN, "no lint failures", "Graduate the rule"))
-        print("")
+        if (not lints_failed) and (not lints_warned) and has_examples:
+            print("")
+            print("%s%s" % ("    (nursery) ", rule.name))
+            print("%s  %s: %s: %s" % ("    ", Lint.WARN, green("no lint failures"), "Graduate the rule"))
+            print("")
+    else:
+        lints_failed = len(tuple(filter(lambda v: v.level == Lint.FAIL, violations)))
+        lints_warned = len(tuple(filter(lambda v: v.level == Lint.WARN, violations)))
 
-    return lints_failed and not is_nursery_rule(rule)
+    return (lints_failed, lints_warned)
 
 
 def lint(ctx, rules):
@@ -546,15 +632,20 @@ def lint(ctx, rules):
         for each sample, record sample id of sha256, md5, and filename.
         see `collect_samples(path)`.
       rules (List[Rule]): the rules to lint.
+
+    Returns: Dict[string, Tuple(int, int)]
+      - # lints failed
+      - # lints warned
     """
-    did_suggest_fix = False
-    for rule in rules.rules.values():
+    ret = {}
+
+    for name, rule in rules.rules.items():
         if rule.meta.get("capa/subscope-rule", False):
             continue
 
-        did_suggest_fix = lint_rule(ctx, rule) or did_suggest_fix
+        ret[name] = lint_rule(ctx, rule)
 
-    return did_suggest_fix
+    return ret
 
 
 def collect_samples(path):
@@ -651,16 +742,33 @@ def main(argv=None):
         "is_thorough": args.thorough,
     }
 
-    did_violate = lint(ctx, rules)
+    results_by_name = lint(ctx, rules)
+    failed_rules = []
+    warned_rules = []
+    for name, (fail_count, warn_count) in results_by_name.items():
+        if fail_count > 0:
+            failed_rules.append(name)
+
+        if warn_count > 0:
+            warned_rules.append(name)
 
     min, sec = divmod(time.time() - time0, 60)
     logger.debug("lints ran for ~ %02d:%02dm", min, sec)
 
-    if not did_violate:
-        logger.info("no lints failed, nice!")
-        return 0
-    else:
+    if warned_rules:
+        print(orange("rules with WARN:"))
+        for warned_rule in sorted(warned_rules):
+            print("  - " + warned_rule)
+        print()
+
+    if failed_rules:
+        print(red("rules with FAIL:"))
+        for failed_rule in sorted(failed_rules):
+            print("  - " + failed_rule)
         return 1
+    else:
+        logger.info(green("no lints failed, nice!"))
+        return 0
 
 
 if __name__ == "__main__":

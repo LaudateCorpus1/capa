@@ -20,9 +20,12 @@ from PyQt5 import QtGui, QtCore, QtWidgets
 
 import capa.main
 import capa.rules
+import capa.engine
 import capa.ida.helpers
-import capa.render.utils as rutils
-import capa.features.extractors.ida
+import capa.render.json
+import capa.features.common
+import capa.render.result_document
+import capa.features.extractors.ida.extractor
 from capa.ida.plugin.icon import QICON
 from capa.ida.plugin.view import (
     CapaExplorerQtreeView,
@@ -40,6 +43,13 @@ settings = ida_settings.IDASettings("capa")
 CAPA_SETTINGS_RULE_PATH = "rule_path"
 CAPA_SETTINGS_RULEGEN_AUTHOR = "rulegen_author"
 CAPA_SETTINGS_RULEGEN_SCOPE = "rulegen_scope"
+
+from enum import IntFlag
+
+
+class Options(IntFlag):
+    DEFAULT = 0
+    ANALYZE = 1  # Runs the analysis when starting the explorer
 
 
 def write_file(path, data):
@@ -97,7 +107,7 @@ def find_func_matches(f, ruleset, func_features, bb_features):
         for (name, res) in matches.items():
             bb_matches[name].extend(res)
             for (ea, _) in res:
-                func_features[capa.features.MatchedRule(name)].add(ea)
+                func_features[capa.features.common.MatchedRule(name)].add(ea)
 
     # find rule matches for function, function features include rule matches for basic blocks
     _, matches = capa.engine.match(ruleset.function_rules, func_features, int(f))
@@ -155,7 +165,7 @@ class CapaExplorerProgressIndicator(QtCore.QObject):
         self.progress.emit("extracting features from %s" % text)
 
 
-class CapaExplorerFeatureExtractor(capa.features.extractors.ida.IdaFeatureExtractor):
+class CapaExplorerFeatureExtractor(capa.features.extractors.ida.extractor.IdaFeatureExtractor):
     """subclass the IdaFeatureExtractor
 
     track progress during feature extraction, also allow user to cancel feature extraction
@@ -227,7 +237,7 @@ class CapaSettingsInputDialog(QtWidgets.QDialog):
 class CapaExplorerForm(idaapi.PluginForm):
     """form element for plugin interface"""
 
-    def __init__(self, name):
+    def __init__(self, name, option=Options.DEFAULT):
         """initialize form elements"""
         super(CapaExplorerForm, self).__init__()
 
@@ -274,6 +284,9 @@ class CapaExplorerForm(idaapi.PluginForm):
         self.view_rulegen_status_label = None
 
         self.Show()
+
+        if (option & Options.ANALYZE) == Options.ANALYZE:
+            self.analyze_program()
 
     def OnCreate(self, form):
         """called when plugin form is created
@@ -770,7 +783,9 @@ class CapaExplorerForm(idaapi.PluginForm):
             update_wait_box("rendering results")
 
             try:
-                self.doc = capa.render.convert_capabilities_to_result_document(meta, self.ruleset_cache, capabilities)
+                self.doc = capa.render.result_document.convert_capabilities_to_result_document(
+                    meta, self.ruleset_cache, capabilities
+                )
             except Exception as e:
                 logger.error("Failed to render results (error: %s)", e)
                 return False
@@ -865,7 +880,7 @@ class CapaExplorerForm(idaapi.PluginForm):
                         if rule.meta.get("capa/subscope-rule"):
                             continue
                         for (ea, _) in res:
-                            func_features[capa.features.MatchedRule(name)].add(ea)
+                            func_features[capa.features.common.MatchedRule(name)].add(ea)
                 except Exception as e:
                     logger.error("Failed to match function/basic block rule scope (error: %s)" % e)
                     return False
@@ -899,7 +914,7 @@ class CapaExplorerForm(idaapi.PluginForm):
                     if rule.meta.get("capa/subscope-rule"):
                         continue
                     for (ea, _) in res:
-                        file_features[capa.features.MatchedRule(name)].add(ea)
+                        file_features[capa.features.common.MatchedRule(name)].add(ea)
             except Exception as e:
                 logger.error("Failed to match file scope rules (error: %s)" % e)
                 return False
@@ -1123,7 +1138,7 @@ class CapaExplorerForm(idaapi.PluginForm):
             idaapi.info("No program analysis to save.")
             return
 
-        s = json.dumps(self.doc, sort_keys=True, cls=capa.render.CapaJsonObjectEncoder).encode("utf-8")
+        s = json.dumps(self.doc, sort_keys=True, cls=capa.render.json.CapaJsonObjectEncoder).encode("utf-8")
 
         path = idaapi.ask_file(True, "*.json", "Choose file to save capa program analysis JSON")
         if not path:

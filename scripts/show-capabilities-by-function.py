@@ -59,10 +59,10 @@ import colorama
 import capa.main
 import capa.rules
 import capa.engine
-import capa.render
 import capa.features
 import capa.render.utils as rutils
 import capa.features.freeze
+import capa.render.result_document
 from capa.helpers import get_file_taste
 
 logger = logging.getLogger("capa.show-capabilities-by-function")
@@ -121,20 +121,6 @@ def main(argv=None):
         logger.error("%s", str(e))
         return -1
 
-    if args.rules == "(embedded rules)":
-        logger.info("-" * 80)
-        logger.info(" Using default embedded rules.")
-        logger.info(" To provide your own rules, use the form `capa.exe -r ./path/to/rules/  /path/to/mal.exe`.")
-        logger.info(" You can see the current default rule set here:")
-        logger.info("     https://github.com/fireeye/capa-rules")
-        logger.info("-" * 80)
-
-        logger.debug("detected running from source")
-        args.rules = os.path.join(os.path.dirname(__file__), "..", "rules")
-        logger.debug("default rule path (source method): %s", args.rules)
-    else:
-        logger.info("using rules path: %s", args.rules)
-
     try:
         rules = capa.main.get_rules(args.rules)
         rules = capa.rules.RuleSet(rules)
@@ -146,15 +132,24 @@ def main(argv=None):
         logger.error("%s", str(e))
         return -1
 
+    try:
+        sig_paths = capa.main.get_signatures(args.signatures)
+    except (IOError) as e:
+        logger.error("%s", str(e))
+        return -1
+
     if (args.format == "freeze") or (args.format == "auto" and capa.features.freeze.is_freeze(taste)):
         format = "freeze"
         with open(args.sample, "rb") as f:
             extractor = capa.features.freeze.load(f.read())
     else:
         format = args.format
+        should_save_workspace = os.environ.get("CAPA_SAVE_WORKSPACE") not in ("0", "no", "NO", "n", None)
 
         try:
-            extractor = capa.main.get_extractor(args.sample, args.format, args.backend, args.signatures)
+            extractor = capa.main.get_extractor(
+                args.sample, args.format, args.backend, sig_paths, should_save_workspace
+            )
         except capa.main.UnsupportedFormatError:
             logger.error("-" * 80)
             logger.error(" Input file does not appear to be a PE file.")
@@ -191,7 +186,7 @@ def main(argv=None):
     #  - when not an interactive session, and disable coloring
     # renderers should use coloring and assume it will be stripped out if necessary.
     colorama.init()
-    doc = capa.render.convert_capabilities_to_result_document(meta, rules, capabilities)
+    doc = capa.render.result_document.convert_capabilities_to_result_document(meta, rules, capabilities)
     print(render_matches_by_function(doc))
     colorama.deinit()
 

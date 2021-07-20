@@ -6,22 +6,33 @@
 #  is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
 
-from capa.features import Feature
+from capa.features.common import Feature
 
 
 class Export(Feature):
-    def __init__(self, value, description=None):
+    def __init__(self, value: str, description=None):
         # value is export name
         super(Export, self).__init__(value, description=description)
 
 
 class Import(Feature):
-    def __init__(self, value, description=None):
+    def __init__(self, value: str, description=None):
         # value is import name
         super(Import, self).__init__(value, description=description)
 
 
 class Section(Feature):
-    def __init__(self, value, description=None):
+    def __init__(self, value: str, description=None):
         # value is section name
         super(Section, self).__init__(value, description=description)
+
+
+class FunctionName(Feature):
+    """recognized name for statically linked function"""
+
+    def __init__(self, name: str, description=None):
+        # value is function name
+        super(FunctionName, self).__init__(name, description=description)
+        # override the name property set by `capa.features.Feature`
+        # that would be `functionname` (note missing dash)
+        self.name = "function-name"

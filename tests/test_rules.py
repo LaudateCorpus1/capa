@@ -11,8 +11,11 @@ import textwrap
 import pytest
 
 import capa.rules
-from capa.features import ARCH_X32, ARCH_X64, String
+import capa.engine
+import capa.features.common
+from capa.features.file import FunctionName
 from capa.features.insn import Number, Offset
+from capa.features.common import ARCH_X32, ARCH_X64, String
 
 
 def test_rule_ctor():
@@ -396,6 +399,34 @@ def test_invalid_rules():
             )
         )
 
+    # att&ck and mbc must be lists
+    with pytest.raises(capa.rules.InvalidRule):
+        r = capa.rules.Rule.from_yaml(
+            textwrap.dedent(
+                """
+                rule:
+                    meta:
+                        name: test rule
+                        att&ck: Tactic::Technique::Subtechnique [Identifier]
+                    features:
+                        - number: 1
+                """
+            )
+        )
+    with pytest.raises(capa.rules.InvalidRule):
+        r = capa.rules.Rule.from_yaml(
+            textwrap.dedent(
+                """
+                rule:
+                    meta:
+                        name: test rule
+                        mbc: Objective::Behavior::Method [Identifier]
+                    features:
+                        - number: 1
+                """
+            )
+        )
+
 
 def test_number_symbol():
     rule = textwrap.dedent(
@@ -720,18 +751,18 @@ def test_regex_values_always_string():
         ),
     ]
     features, matches = capa.engine.match(
-        capa.engine.topologically_order_rules(rules),
-        {capa.features.String("123"): {1}},
+        capa.rules.topologically_order_rules(rules),
+        {capa.features.common.String("123"): {1}},
         0x0,
     )
-    assert capa.features.MatchedRule("test rule") in features
+    assert capa.features.common.MatchedRule("test rule") in features
 
     features, matches = capa.engine.match(
-        capa.engine.topologically_order_rules(rules),
-        {capa.features.String("0x123"): {1}},
+        capa.rules.topologically_order_rules(rules),
+        {capa.features.common.String("0x123"): {1}},
         0x0,
     )
-    assert capa.features.MatchedRule("test rule") in features
+    assert capa.features.common.MatchedRule("test rule") in features
 
 
 def test_filter_rules():
@@ -891,3 +922,25 @@ def test_rules_namespace_dependencies():
     assert "rule 1" in r4
     assert "rule 2" in r4
     assert "rule 3" not in r4
+
+
+def test_function_name_features():
+    rule = textwrap.dedent(
+        """
+        rule:
+            meta:
+                name: test rule
+                scope: file
+            features:
+                - and:
+                    - function-name: strcpy
+                    - function-name: strcmp = copy from here to there
+                    - function-name: strdup
+                      description: duplicate a string
+        """
+    )
+    r = capa.rules.Rule.from_yaml(rule)
+    children = list(r.statement.get_children())
+    assert (FunctionName("strcpy") in children) == True
+    assert (FunctionName("strcmp", description="copy from here to there") in children) == True
+    assert (FunctionName("strdup", description="duplicate a string") in children) == True

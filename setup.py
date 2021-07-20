@@ -11,19 +11,21 @@ import os
 import setuptools
 
 requirements = [
-    "tqdm==4.60.0",
+    "tqdm==4.61.2",
     "pyyaml==5.4.1",
     "tabulate==0.8.9",
     "colorama==0.4.4",
     "termcolor==1.1.0",
     "wcwidth==0.2.5",
     "ida-settings==2.1.0",
-    "viv-utils[flirt]==0.6.2",
+    "viv-utils[flirt]==0.6.5",
     "halo==0.0.31",
     "networkx==2.5.1",
-    "ruamel.yaml==0.17.4",
+    "ruamel.yaml==0.17.10",
     "vivisect==1.0.3",
-    "smda==1.5.14",
+    "smda==1.5.18",
+    "pefile==2021.5.24",
+    "typing==3.7.4.3",
 ]
 
 # this sets __version__
@@ -67,11 +69,18 @@ setuptools.setup(
             "pytest==6.2.4",
             "pytest-sugar==0.9.4",
             "pytest-instafail==0.4.2",
-            "pytest-cov==2.12.0",
+            "pytest-cov==2.12.1",
             "pycodestyle==2.7.0",
-            "black==21.5b1",
-            "isort==5.8.0",
-        ]
+            "black==21.7b0",
+            "isort==5.9.2",
+            "mypy==0.910",
+            # type stubs for mypy
+            "types-backports==0.1.3",
+            "types-colorama==0.4.2",
+            "types-PyYAML==5.4.3",
+            "types-tabulate==0.1.1",
+            "types-termcolor==0.1.1",
+        ],
     },
     zip_safe=False,
     keywords="capa malware analysis capability detection FLARE",

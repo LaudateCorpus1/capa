@@ -6,30 +6,35 @@
 #  is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
 
+import io
 import re
 import uuid
 import codecs
 import logging
 import binascii
 import functools
+import collections
 
 try:
     from functools import lru_cache
 except ImportError:
-    from backports.functools_lru_cache import lru_cache
+    # need to type ignore this due to mypy bug here (duplicate name):
+    # https://github.com/python/mypy/issues/1153
+    from backports.functools_lru_cache import lru_cache  # type: ignore
 
-import io
+from typing import Any, Set, Dict, List, Union, Iterator
 
 import yaml
 import ruamel.yaml
 
-import capa.engine
+import capa.engine as ceng
 import capa.features
 import capa.features.file
 import capa.features.insn
+import capa.features.common
 import capa.features.basicblock
-from capa.engine import *
-from capa.features import MAX_BYTES_FEATURE_SIZE
+from capa.engine import Statement, FeatureSet
+from capa.features.common import MAX_BYTES_FEATURE_SIZE, Feature
 
 logger = logging.getLogger(__name__)
 
@@ -66,37 +71,38 @@ BASIC_BLOCK_SCOPE = "basic block"
 
 SUPPORTED_FEATURES = {
     FILE_SCOPE: {
-        capa.features.MatchedRule,
+        capa.features.common.MatchedRule,
         capa.features.file.Export,
         capa.features.file.Import,
         capa.features.file.Section,
-        capa.features.Characteristic("embedded pe"),
-        capa.features.String,
+        capa.features.file.FunctionName,
+        capa.features.common.Characteristic("embedded pe"),
+        capa.features.common.String,
     },
     FUNCTION_SCOPE: {
         # plus basic block scope features, see below
         capa.features.basicblock.BasicBlock,
-        capa.features.Characteristic("calls from"),
-        capa.features.Characteristic("calls to"),
-        capa.features.Characteristic("loop"),
-        capa.features.Characteristic("recursive call"),
+        capa.features.common.Characteristic("calls from"),
+        capa.features.common.Characteristic("calls to"),
+        capa.features.common.Characteristic("loop"),
+        capa.features.common.Characteristic("recursive call"),
     },
     BASIC_BLOCK_SCOPE: {
-        capa.features.MatchedRule,
+        capa.features.common.MatchedRule,
         capa.features.insn.API,
         capa.features.insn.Number,
-        capa.features.String,
-        capa.features.Bytes,
+        capa.features.common.String,
+        capa.features.common.Bytes,
         capa.features.insn.Offset,
         capa.features.insn.Mnemonic,
-        capa.features.Characteristic("nzxor"),
-        capa.features.Characteristic("peb access"),
-        capa.features.Characteristic("fs access"),
-        capa.features.Characteristic("gs access"),
-        capa.features.Characteristic("cross section flow"),
-        capa.features.Characteristic("tight loop"),
-        capa.features.Characteristic("stack string"),
-        capa.features.Characteristic("indirect call"),
+        capa.features.common.Characteristic("nzxor"),
+        capa.features.common.Characteristic("peb access"),
+        capa.features.common.Characteristic("fs access"),
+        capa.features.common.Characteristic("gs access"),
+        capa.features.common.Characteristic("cross section flow"),
+        capa.features.common.Characteristic("tight loop"),
+        capa.features.common.Characteristic("stack string"),
+        capa.features.common.Characteristic("indirect call"),
     },
 }
 
@@ -139,22 +145,32 @@ class InvalidRuleSet(ValueError):
         return str(self)
 
 
-def ensure_feature_valid_for_scope(scope, feature):
-    if isinstance(feature, capa.features.Characteristic):
-        if capa.features.Characteristic(feature.value) not in SUPPORTED_FEATURES[scope]:
-            raise InvalidRule("feature %s not support for scope %s" % (feature, scope))
-    elif not isinstance(feature, tuple(filter(lambda t: isinstance(t, type), SUPPORTED_FEATURES[scope]))):
+def ensure_feature_valid_for_scope(scope: str, feature: Union[Feature, Statement]):
+    # if the given feature is a characteristic,
+    # check that is a valid characteristic for the given scope.
+    if (
+        isinstance(feature, capa.features.common.Characteristic)
+        and isinstance(feature.value, str)
+        and capa.features.common.Characteristic(feature.value) not in SUPPORTED_FEATURES[scope]
+    ):
         raise InvalidRule("feature %s not support for scope %s" % (feature, scope))
 
+    if not isinstance(feature, capa.features.common.Characteristic):
+        # features of this scope that are not Characteristics will be Type instances.
+        # check that the given feature is one of these types.
+        types_for_scope = filter(lambda t: isinstance(t, type), SUPPORTED_FEATURES[scope])
+        if not isinstance(feature, tuple(types_for_scope)):  # type: ignore
+            raise InvalidRule("feature %s not support for scope %s" % (feature, scope))
 
-def parse_int(s):
+
+def parse_int(s: str) -> int:
     if s.startswith("0x"):
         return int(s, 0x10)
     else:
         return int(s, 10)
 
 
-def parse_range(s):
+def parse_range(s: str):
     """
     parse a string "(0, 1)" into a range (min, max).
     min and/or max may by None to indicate an unbound range.
@@ -167,23 +183,21 @@ def parse_range(s):
         raise InvalidRule("invalid range: %s" % (s))
 
     s = s[len("(") : -len(")")]
-    min, _, max = s.partition(",")
-    min = min.strip()
-    max = max.strip()
+    min_spec, _, max_spec = s.partition(",")
+    min_spec = min_spec.strip()
+    max_spec = max_spec.strip()
 
-    if min:
-        min = parse_int(min.strip())
+    min = None
+    if min_spec:
+        min = parse_int(min_spec)
         if min < 0:
             raise InvalidRule("range min less than zero")
-    else:
-        min = None
 
-    if max:
-        max = parse_int(max.strip())
+    max = None
+    if max_spec:
+        max = parse_int(max_spec)
         if max < 0:
             raise InvalidRule("range max less than zero")
-    else:
-        max = None
 
     if min is not None and max is not None:
         if max < min:
@@ -192,14 +206,14 @@ def parse_range(s):
     return min, max
 
 
-def parse_feature(key):
+def parse_feature(key: str):
     # keep this in sync with supported features
     if key == "api":
         return capa.features.insn.API
     elif key == "string":
-        return capa.features.StringFactory
+        return capa.features.common.StringFactory
     elif key == "bytes":
-        return capa.features.Bytes
+        return capa.features.common.Bytes
     elif key == "number":
         return capa.features.insn.Number
     elif key.startswith("number/"):
@@ -221,7 +235,7 @@ def parse_feature(key):
     elif key == "basic blocks":
         return capa.features.basicblock.BasicBlock
     elif key == "characteristic":
-        return capa.features.Characteristic
+        return capa.features.common.Characteristic
     elif key == "export":
         return capa.features.file.Export
     elif key == "import":
@@ -229,7 +243,9 @@ def parse_feature(key):
     elif key == "section":
         return capa.features.file.Section
     elif key == "match":
-        return capa.features.MatchedRule
+        return capa.features.common.MatchedRule
+    elif key == "function-name":
+        return capa.features.file.FunctionName
     else:
         raise InvalidRule("unexpected statement: %s" % key)
 
@@ -241,38 +257,70 @@ def parse_feature(key):
 DESCRIPTION_SEPARATOR = " = "
 
 
-def parse_description(s, value_type, description=None):
-    """
-    s can be an int or a string
-    """
-    if value_type != "string" and isinstance(s, str) and DESCRIPTION_SEPARATOR in s:
-        if description:
-            raise InvalidRule(
-                'unexpected value: "%s", only one description allowed (inline description with `%s`)'
-                % (s, DESCRIPTION_SEPARATOR)
-            )
-        value, _, description = s.partition(DESCRIPTION_SEPARATOR)
-        if description == "":
-            raise InvalidRule('unexpected value: "%s", description cannot be empty' % s)
-    else:
+def parse_bytes(s: str) -> bytes:
+    try:
+        b = codecs.decode(s.replace(" ", "").encode("ascii"), "hex")
+    except binascii.Error:
+        raise InvalidRule('unexpected bytes value: must be a valid hex sequence: "%s"' % s)
+
+    if len(b) > MAX_BYTES_FEATURE_SIZE:
+        raise InvalidRule(
+            "unexpected bytes value: byte sequences must be no larger than %s bytes" % MAX_BYTES_FEATURE_SIZE
+        )
+
+    return b
+
+
+def parse_description(s: Union[str, int, bytes], value_type: str, description=None):
+    if value_type == "string":
+        # string features cannot have inline descriptions,
+        # so we assume the entire value is the string,
+        # like: `string: foo = bar` -> "foo = bar"
         value = s
+    else:
+        # other features can have inline descriptions, like `number: 10 = CONST_FOO`.
+        # in this case, the RHS will be like `10 = CONST_FOO` or some other string
+        if isinstance(s, str):
+            if DESCRIPTION_SEPARATOR in s:
+                if description:
+                    # there is already a description passed in as a sub node, like:
+                    #
+                    #     - number: 10 = CONST_FOO
+                    #       description: CONST_FOO
+                    raise InvalidRule(
+                        'unexpected value: "%s", only one description allowed (inline description with `%s`)'
+                        % (s, DESCRIPTION_SEPARATOR)
+                    )
 
-    if isinstance(value, str):
-        if value_type == "bytes":
-            try:
-                value = codecs.decode(value.replace(" ", ""), "hex")
-            except binascii.Error:
-                raise InvalidRule('unexpected bytes value: "%s", must be a valid hex sequence' % value)
+                value, _, description = s.partition(DESCRIPTION_SEPARATOR)
+                if description == "":
+                    # sanity check:
+                    # there is an empty description, like `number: 10 =`
+                    raise InvalidRule('unexpected value: "%s", description cannot be empty' % s)
+            else:
+                # this is a string, but there is no description,
+                # like: `api: CreateFileA`
+                value = s
 
-            if len(value) > MAX_BYTES_FEATURE_SIZE:
-                raise InvalidRule(
-                    "unexpected bytes value: byte sequences must be no larger than %s bytes" % MAX_BYTES_FEATURE_SIZE
-                )
-        elif value_type in ("number", "offset") or value_type.startswith(("number/", "offset/")):
-            try:
-                value = parse_int(value)
-            except ValueError:
-                raise InvalidRule('unexpected value: "%s", must begin with numerical value' % value)
+            # cast from the received string value to the appropriate type.
+            #
+            # without a description, this type would already be correct,
+            # but since we parsed the description from a string,
+            # we need to convert the value to the expected type.
+            #
+            # for example, from `number: 10 = CONST_FOO` we have
+            # the string "10" that needs to become the number 10.
+            if value_type == "bytes":
+                value = parse_bytes(value)
+            elif value_type in ("number", "offset") or value_type.startswith(("number/", "offset/")):
+                try:
+                    value = parse_int(value)
+                except ValueError:
+                    raise InvalidRule('unexpected value: "%s", must begin with numerical value' % value)
+
+        else:
+            # the value might be a number, like: `number: 10`
+            value = s
 
     return value, description
 
@@ -312,28 +360,28 @@ def pop_statement_description_entry(d):
     return description["description"]
 
 
-def build_statements(d, scope):
+def build_statements(d, scope: str):
     if len(d.keys()) > 2:
         raise InvalidRule("too many statements")
 
     key = list(d.keys())[0]
     description = pop_statement_description_entry(d[key])
     if key == "and":
-        return And([build_statements(dd, scope) for dd in d[key]], description=description)
+        return ceng.And([build_statements(dd, scope) for dd in d[key]], description=description)
     elif key == "or":
-        return Or([build_statements(dd, scope) for dd in d[key]], description=description)
+        return ceng.Or([build_statements(dd, scope) for dd in d[key]], description=description)
     elif key == "not":
         if len(d[key]) != 1:
             raise InvalidRule("not statement must have exactly one child statement")
-        return Not(build_statements(d[key][0], scope), description=description)
+        return ceng.Not(build_statements(d[key][0], scope), description=description)
     elif key.endswith(" or more"):
         count = int(key[: -len("or more")])
-        return Some(count, [build_statements(dd, scope) for dd in d[key]], description=description)
+        return ceng.Some(count, [build_statements(dd, scope) for dd in d[key]], description=description)
     elif key == "optional":
         # `optional` is an alias for `0 or more`
         # which is useful for documenting behaviors,
         # like with `write file`, we might say that `WriteFile` is optionally found alongside `CreateFileA`.
-        return Some(0, [build_statements(dd, scope) for dd in d[key]], description=description)
+        return ceng.Some(0, [build_statements(dd, scope) for dd in d[key]], description=description)
 
     elif key == "function":
         if scope != FILE_SCOPE:
@@ -342,7 +390,7 @@ def build_statements(d, scope):
         if len(d[key]) != 1:
             raise InvalidRule("subscope must have exactly one child statement")
 
-        return Subscope(FUNCTION_SCOPE, build_statements(d[key][0], FUNCTION_SCOPE))
+        return ceng.Subscope(FUNCTION_SCOPE, build_statements(d[key][0], FUNCTION_SCOPE))
 
     elif key == "basic block":
         if scope != FUNCTION_SCOPE:
@@ -351,7 +399,7 @@ def build_statements(d, scope):
         if len(d[key]) != 1:
             raise InvalidRule("subscope must have exactly one child statement")
 
-        return Subscope(BASIC_BLOCK_SCOPE, build_statements(d[key][0], BASIC_BLOCK_SCOPE))
+        return ceng.Subscope(BASIC_BLOCK_SCOPE, build_statements(d[key][0], BASIC_BLOCK_SCOPE))
 
     elif key.startswith("count(") and key.endswith(")"):
         # e.g.:
@@ -392,18 +440,18 @@ def build_statements(d, scope):
 
         count = d[key]
         if isinstance(count, int):
-            return Range(feature, min=count, max=count, description=description)
+            return ceng.Range(feature, min=count, max=count, description=description)
         elif count.endswith(" or more"):
             min = parse_int(count[: -len(" or more")])
             max = None
-            return Range(feature, min=min, max=max, description=description)
+            return ceng.Range(feature, min=min, max=max, description=description)
         elif count.endswith(" or fewer"):
             min = None
             max = parse_int(count[: -len(" or fewer")])
-            return Range(feature, min=min, max=max, description=description)
+            return ceng.Range(feature, min=min, max=max, description=description)
         elif count.startswith("("):
             min, max = parse_range(count)
-            return Range(feature, min=min, max=max, description=description)
+            return ceng.Range(feature, min=min, max=max, description=description)
         else:
             raise InvalidRule("unexpected range: %s" % (count))
     elif key == "string" and not isinstance(d[key], str):
@@ -419,16 +467,16 @@ def build_statements(d, scope):
         return feature
 
 
-def first(s):
+def first(s: List[Any]) -> Any:
     return s[0]
 
 
-def second(s):
+def second(s: List[Any]) -> Any:
     return s[1]
 
 
-class Rule(object):
-    def __init__(self, name, scope, statement, meta, definition=""):
+class Rule:
+    def __init__(self, name: str, scope: str, statement: Statement, meta, definition=""):
         super(Rule, self).__init__()
         self.name = name
         self.scope = scope
@@ -458,7 +506,7 @@ class Rule(object):
         deps = set([])
 
         def rec(statement):
-            if isinstance(statement, capa.features.MatchedRule):
+            if isinstance(statement, capa.features.common.MatchedRule):
                 # we're not sure at this point if the `statement.value` is
                 #  really a rule name or a namespace name (we use `MatchedRule` for both cases).
                 # we'll give precedence to namespaces, and then assume if that does work,
@@ -474,7 +522,7 @@ class Rule(object):
                     # not a namespace, assume its a rule name.
                     deps.add(statement.value)
 
-            elif isinstance(statement, Statement):
+            elif isinstance(statement, ceng.Statement):
                 for child in statement.get_children():
                     rec(child)
 
@@ -485,11 +533,9 @@ class Rule(object):
         return deps
 
     def _extract_subscope_rules_rec(self, statement):
-        if isinstance(statement, Statement):
+        if isinstance(statement, ceng.Statement):
             # for each child that is a subscope,
-            for subscope in filter(
-                lambda statement: isinstance(statement, capa.engine.Subscope), statement.get_children()
-            ):
+            for subscope in filter(lambda statement: isinstance(statement, ceng.Subscope), statement.get_children()):
 
                 # create a new rule from it.
                 # the name is a randomly generated, hopefully unique value.
@@ -514,7 +560,7 @@ class Rule(object):
                 )
 
                 # update the existing statement to `match` the new rule
-                new_node = capa.features.MatchedRule(name)
+                new_node = capa.features.common.MatchedRule(name)
                 statement.replace_child(subscope, new_node)
 
                 # and yield the new rule to our caller
@@ -551,15 +597,16 @@ class Rule(object):
         for new_rule in self._extract_subscope_rules_rec(self.statement):
             yield new_rule
 
-    def evaluate(self, features):
+    def evaluate(self, features: FeatureSet):
         return self.statement.evaluate(features)
 
     @classmethod
     def from_dict(cls, d, definition):
-        name = d["rule"]["meta"]["name"]
+        meta = d["rule"]["meta"]
+        name = meta["name"]
         # if scope is not specified, default to function scope.
         # this is probably the mode that rule authors will start with.
-        scope = d["rule"]["meta"].get("scope", FUNCTION_SCOPE)
+        scope = meta.get("scope", FUNCTION_SCOPE)
         statements = d["rule"]["features"]
 
         # the rule must start with a single logic node.
@@ -567,13 +614,19 @@ class Rule(object):
         if len(statements) != 1:
             raise InvalidRule("rule must begin with a single top level statement")
 
-        if isinstance(statements[0], capa.engine.Subscope):
+        if isinstance(statements[0], ceng.Subscope):
             raise InvalidRule("top level statement may not be a subscope")
 
         if scope not in SUPPORTED_FEATURES.keys():
             raise InvalidRule("{:s} is not a supported scope".format(scope))
 
-        return cls(name, scope, build_statements(statements[0], scope), d["rule"]["meta"], definition)
+        meta = d["rule"]["meta"]
+        if not isinstance(meta.get("att&ck", []), list):
+            raise InvalidRule("ATT&CK mapping must be a list")
+        if not isinstance(meta.get("mbc", []), list):
+            raise InvalidRule("MBC mapping must be a list")
+
+        return cls(name, scope, build_statements(statements[0], scope), meta, definition)
 
     @staticmethod
     @lru_cache()
@@ -741,50 +794,37 @@ class Rule(object):
         return doc
 
 
-def get_rules_with_scope(rules, scope):
+def get_rules_with_scope(rules, scope) -> List[Rule]:
     """
     from the given collection of rules, select those with the given scope.
-
-    args:
-      rules (List[capa.rules.Rule]):
-      scope (str): one of the capa.rules.*_SCOPE constants.
-
-    returns:
-      List[capa.rules.Rule]:
+    `scope` is one of the capa.rules.*_SCOPE constants.
     """
     return list(rule for rule in rules if rule.scope == scope)
 
 
-def get_rules_and_dependencies(rules, rule_name):
+def get_rules_and_dependencies(rules: List[Rule], rule_name: str) -> Iterator[Rule]:
     """
     from the given collection of rules, select a rule and its dependencies (transitively).
-
-    args:
-      rules (List[Rule]):
-      rule_name (str):
-
-    yields:
-      Rule:
     """
     # we evaluate `rules` multiple times, so if its a generator, realize it into a list.
     rules = list(rules)
     namespaces = index_rules_by_namespace(rules)
-    rules = {rule.name: rule for rule in rules}
+    rules_by_name = {rule.name: rule for rule in rules}
     wanted = set([rule_name])
 
     def rec(rule):
         wanted.add(rule.name)
         for dep in rule.get_dependencies(namespaces):
-            rec(rules[dep])
+            rec(rules_by_name[dep])
 
-    rec(rules[rule_name])
+    rec(rules_by_name[rule_name])
 
-    for rule in rules.values():
+    for rule in rules_by_name.values():
         if rule.name in wanted:
             yield rule
 
 
-def ensure_rules_are_unique(rules):
+def ensure_rules_are_unique(rules: List[Rule]) -> None:
     seen = set([])
     for rule in rules:
         if rule.name in seen:
@@ -792,7 +832,7 @@ def ensure_rules_are_unique(rules):
         seen.add(rule.name)
 
 
-def ensure_rule_dependencies_are_met(rules):
+def ensure_rule_dependencies_are_met(rules: List[Rule]) -> None:
     """
     raise an exception if a rule dependency does not exist.
 
@@ -802,14 +842,14 @@ def ensure_rule_dependencies_are_met(rules):
     # we evaluate `rules` multiple times, so if its a generator, realize it into a list.
     rules = list(rules)
     namespaces = index_rules_by_namespace(rules)
-    rules = {rule.name: rule for rule in rules}
-    for rule in rules.values():
+    rules_by_name = {rule.name: rule for rule in rules}
+    for rule in rules_by_name.values():
         for dep in rule.get_dependencies(namespaces):
-            if dep not in rules:
+            if dep not in rules_by_name:
                 raise InvalidRule('rule "%s" depends on missing rule "%s"' % (rule.name, dep))
 
 
-def index_rules_by_namespace(rules):
+def index_rules_by_namespace(rules: List[Rule]) -> Dict[str, List[Rule]]:
     """
     compute the rules that fit into each namespace found within the given rules.
 
@@ -823,11 +863,6 @@ def index_rules_by_namespace(rules):
       c2/shell: [create reverse shell]
       c2/file-transfer: [download and write a file]
       c2: [create reverse shell, download and write a file]
-
-    Args:
-      rules (List[Rule]):
-
-    Returns: Dict[str, List[Rule]]
     """
     namespaces = collections.defaultdict(list)
 
@@ -843,7 +878,38 @@ def index_rules_by_namespace(rules):
     return dict(namespaces)
 
 
-class RuleSet(object):
+def topologically_order_rules(rules: List[Rule]) -> List[Rule]:
+    """
+    order the given rules such that dependencies show up before dependents.
+    this means that as we match rules, we can add features for the matches, and these
+     will be matched by subsequent rules if they follow this order.
+
+    assumes that the rule dependency graph is a DAG.
+    """
+    # we evaluate `rules` multiple times, so if its a generator, realize it into a list.
+    rules = list(rules)
+    namespaces = index_rules_by_namespace(rules)
+    rules_by_name = {rule.name: rule for rule in rules}
+    seen = set([])
+    ret = []
+
+    def rec(rule):
+        if rule.name in seen:
+            return
+
+        for dep in rule.get_dependencies(namespaces):
+            rec(rules_by_name[dep])
+
+        ret.append(rule)
+        seen.add(rule.name)
+
+    for rule in rules_by_name.values():
+        rec(rule)
+
+    return ret
+
+
+class RuleSet:
     """
     a ruleset is initialized with a collection of rules, which it verifies and sorts into scopes.
     each set of scoped rules is sorted topologically, which enables rules to match on past rule matches.
@@ -858,7 +924,7 @@ class RuleSet(object):
         capa.engine.match(ruleset.file_rules, ...)
     """
 
-    def __init__(self, rules):
+    def __init__(self, rules: List[Rule]):
         super(RuleSet, self).__init__()
 
         ensure_rules_are_unique(rules)
@@ -874,12 +940,16 @@ class RuleSet(object):
         self.function_rules = self._get_rules_for_scope(rules, FUNCTION_SCOPE)
         self.basic_block_rules = self._get_rules_for_scope(rules, BASIC_BLOCK_SCOPE)
         self.rules = {rule.name: rule for rule in rules}
+        self.rules_by_namespace = index_rules_by_namespace(rules)
 
     def __len__(self):
         return len(self.rules)
 
     def __getitem__(self, rulename):
         return self.rules[rulename]
+
+    def __contains__(self, rulename):
+        return rulename in self.rules
 
     @staticmethod
     def _get_rules_for_scope(rules, scope):
@@ -901,7 +971,7 @@ class RuleSet(object):
                 continue
 
             scope_rules.update(get_rules_and_dependencies(rules, rule.name))
-        return get_rules_with_scope(capa.engine.topologically_order_rules(scope_rules), scope)
+        return get_rules_with_scope(topologically_order_rules(list(scope_rules)), scope)
 
     @staticmethod
     def _extract_subscope_rules(rules):
@@ -925,7 +995,7 @@ class RuleSet(object):
 
         return done
 
-    def filter_rules_by_meta(self, tag):
+    def filter_rules_by_meta(self, tag: str) -> "RuleSet":
         """
         return new rule set with rules filtered based on all meta field values, adds all dependency rules
         apply tag-based rule filter assuming that all required rules are loaded
@@ -934,7 +1004,7 @@ class RuleSet(object):
         TODO handle circular dependencies?
         TODO support -t=metafield <k>
         """
-        rules = self.rules.values()
+        rules = list(self.rules.values())
         rules_filtered = set([])
         for rule in rules:
             for k, v in rule.meta.items():

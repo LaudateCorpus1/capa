@@ -26,6 +26,9 @@ import tabulate
 
 import capa.rules
 import capa.render.utils as rutils
+import capa.render.result_document
+from capa.rules import RuleSet
+from capa.engine import MatchResults
 
 
 def render_meta(ostream, doc):
@@ -57,6 +60,7 @@ def render_meta(ostream, doc):
         ("base address", hex(doc["meta"]["analysis"]["base_address"])),
         ("rules", doc["meta"]["analysis"]["rules"]),
         ("function count", len(doc["meta"]["analysis"]["feature_counts"]["functions"])),
+        ("library function count", len(doc["meta"]["analysis"]["library_functions"])),
         (
             "total feature count",
             doc["meta"]["analysis"]["feature_counts"]["file"]
@@ -119,3 +123,8 @@ def render_verbose(doc):
     ostream.write("\n")
 
     return ostream.getvalue()
+
+
+def render(meta, rules: RuleSet, capabilities: MatchResults) -> str:
+    doc = capa.render.result_document.convert_capabilities_to_result_document(meta, rules, capabilities)
+    return render_verbose(doc)

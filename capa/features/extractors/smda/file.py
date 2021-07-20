@@ -1,65 +1,17 @@
-import struct
-
 # if we have SMDA we definitely have lief
 import lief
 
 import capa.features.extractors.helpers
 import capa.features.extractors.strings
-from capa.features import String, Characteristic
 from capa.features.file import Export, Import, Section
-
-
-def carve(pbytes, offset=0):
-    """
-    Return a list of (offset, size, xor) tuples of embedded PEs
-
-    Based on the version from vivisect:
-    https://github.com/vivisect/vivisect/blob/7be4037b1cecc4551b397f840405a1fc606f9b53/PE/carve.py#L19
-    And its IDA adaptation:
-    capa/features/extractors/ida/file.py
-    """
-    mz_xor = [
-        (
-            capa.features.extractors.helpers.xor_static(b"MZ", i),
-            capa.features.extractors.helpers.xor_static(b"PE", i),
-            i,
-        )
-        for i in range(256)
-    ]
-
-    pblen = len(pbytes)
-    todo = [(pbytes.find(mzx, offset), mzx, pex, i) for mzx, pex, i in mz_xor]
-    todo = [(off, mzx, pex, i) for (off, mzx, pex, i) in todo if off != -1]
-
-    while len(todo):
-
-        off, mzx, pex, i = todo.pop()
-
-        # The MZ header has one field we will check
-        # e_lfanew is at 0x3c
-        e_lfanew = off + 0x3C
-        if pblen < (e_lfanew + 4):
-            continue
-
-        newoff = struct.unpack("<I", capa.features.extractors.helpers.xor_static(pbytes[e_lfanew : e_lfanew + 4], i))[0]
-
-        nextres = pbytes.find(mzx, off + 1)
-        if nextres != -1:
-            todo.append((nextres, mzx, pex, i))
-
-        peoff = off + newoff
-        if pblen < (peoff + 2):
-            continue
-
-        if pbytes[peoff : peoff + 2] == pex:
-            yield (off, i)
+from capa.features.common import String, Characteristic
 
 
 def extract_file_embedded_pe(smda_report, file_path):
     with open(file_path, "rb") as f:
         fbytes = f.read()
 
-    for offset, i in carve(fbytes, 1):
+    for offset, i in capa.features.extractors.helpers.carve_pe(fbytes, 1):
         yield Characteristic("embedded pe"), offset
 
 
@@ -79,8 +31,8 @@ def extract_file_import_names(smda_report, file_path):
         library_name = imported_library.name.lower()
         library_name = library_name[:-4] if library_name.endswith(".dll") else library_name
         for func in imported_library.entries:
+            va = func.iat_address + smda_report.base_addr
             if func.name:
-                va = func.iat_address + smda_report.base_addr
                 for name in capa.features.extractors.helpers.generate_symbols(library_name, func.name):
                     yield Import(name), va
             elif func.is_ordinal:
@@ -112,6 +64,16 @@ def extract_file_strings(smda_report, file_path):
         yield String(s.s), s.offset
 
 
+def extract_file_function_names(smda_report, file_path):
+    """
+    extract the names of statically-linked library functions.
+    """
+    if False:
+        # using a `yield` here to force this to be a generator, not function.
+        yield NotImplementedError("SMDA doesn't have library matching")
+    return
+
+
 def extract_features(smda_report, file_path):
     """
     extract file features from given workspace
@@ -125,7 +87,6 @@ def extract_features(smda_report, file_path):
     """
 
     for file_handler in FILE_HANDLERS:
-        result = file_handler(smda_report, file_path)
         for feature, va in file_handler(smda_report, file_path):
             yield feature, va
 
@@ -136,4 +97,5 @@ FILE_HANDLERS = (
     extract_file_import_names,
     extract_file_section_names,
     extract_file_strings,
+    extract_file_function_names,
 )

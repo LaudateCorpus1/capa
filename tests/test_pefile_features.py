@@ -18,17 +18,11 @@ import capa.features.file
     fixtures.FEATURE_PRESENCE_TESTS,
     indirect=["sample", "scope"],
 )
-def test_smda_features(sample, scope, feature, expected):
-    if scope.__name__ == "file" and isinstance(feature, capa.features.file.FunctionName) and expected is True:
-        pytest.xfail("SMDA has no function ID")
+def test_pefile_features(sample, scope, feature, expected):
+    if scope.__name__ != "file":
+        pytest.xfail("pefile only extract file scope features")
 
-    fixtures.do_test_feature_presence(fixtures.get_smda_extractor, sample, scope, feature, expected)
+    if isinstance(feature, capa.features.file.FunctionName):
+        pytest.xfail("pefile only doesn't extract function names")
 
-
-@parametrize(
-    "sample,scope,feature,expected",
-    fixtures.FEATURE_COUNT_TESTS,
-    indirect=["sample", "scope"],
-)
-def test_smda_feature_counts(sample, scope, feature, expected):
-    fixtures.do_test_feature_count(fixtures.get_smda_extractor, sample, scope, feature, expected)
+    fixtures.do_test_feature_presence(fixtures.get_pefile_extractor, sample, scope, feature, expected)

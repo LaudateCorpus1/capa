@@ -6,7 +6,6 @@
 #  is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
 
-import sys
 import codecs
 
 import idc
@@ -32,7 +31,7 @@ def location_to_hex(location):
     return "%08X" % location
 
 
-class CapaExplorerDataItem(object):
+class CapaExplorerDataItem:
     """store data for CapaExplorerDataModel"""
 
     def __init__(self, parent, data, can_check=True):

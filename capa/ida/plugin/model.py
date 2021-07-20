@@ -12,8 +12,10 @@ import idc
 import idaapi
 from PyQt5 import QtGui, QtCore
 
+import capa.rules
 import capa.ida.helpers
 import capa.render.utils as rutils
+import capa.features.common
 from capa.ida.plugin.item import (
     CapaExplorerDataItem,
     CapaExplorerRuleItem,
@@ -492,7 +494,7 @@ class CapaExplorerDataModel(QtCore.QAbstractItemModel):
         value = feature[feature["type"]]
         if value:
             if key == "string":
-                value = '"%s"' % capa.features.escape_string(value)
+                value = '"%s"' % capa.features.common.escape_string(value)
             if feature.get("description", ""):
                 return "%s(%s = %s)" % (key, value, feature["description"])
             else:
@@ -555,9 +557,14 @@ class CapaExplorerDataModel(QtCore.QAbstractItemModel):
             )
 
         if feature["type"] == "regex":
-            return CapaExplorerStringViewItem(
-                parent, display, location, '"%s"' % capa.features.escape_string(feature["match"])
-            )
+            for s, locations in feature["matches"].items():
+                if location in locations:
+                    return CapaExplorerStringViewItem(
+                        parent, display, location, '"' + capa.features.common.escape_string(s) + '"'
+                    )
+
+            # programming error: the given location should always be found in the regex matches
+            raise ValueError("regex match at location not found")
 
         if feature["type"] == "basicblock":
             return CapaExplorerBlockItem(parent, location)
@@ -583,12 +590,12 @@ class CapaExplorerDataModel(QtCore.QAbstractItemModel):
         if feature["type"] in ("string",):
             # display string preview
             return CapaExplorerStringViewItem(
-                parent, display, location, '"%s"' % capa.features.escape_string(feature[feature["type"]])
+                parent, display, location, '"%s"' % capa.features.common.escape_string(feature[feature["type"]])
             )
 
-        if feature["type"] in ("import", "export"):
+        if feature["type"] in ("import", "export", "function-name"):
             # display no preview
-            return CapaExplorerFeatureItem(parent, display=display)
+            return CapaExplorerFeatureItem(parent, location=location, display=display)
 
         raise RuntimeError("unexpected feature type: " + str(feature["type"]))
 

@@ -5,15 +5,20 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the License
 #  is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
+import envi
+import envi.exc
 import viv_utils
 import envi.memory
 import viv_utils.flirt
+import envi.archs.i386.regs
+import envi.archs.amd64.regs
 import envi.archs.i386.disasm
+import envi.archs.amd64.disasm
 
-import capa.features.extractors.viv
 import capa.features.extractors.helpers
 import capa.features.extractors.viv.helpers
-from capa.features import (
+from capa.features.insn import API, Number, Offset, Mnemonic
+from capa.features.common import (
     ARCH_X32,
     ARCH_X64,
     MAX_BYTES_FEATURE_SIZE,
@@ -22,7 +27,6 @@ from capa.features import (
     String,
     Characteristic,
 )
-from capa.features.insn import API, Number, Offset, Mnemonic
 from capa.features.extractors.viv.indirect_calls import NotFoundError, resolve_indirect_call
 
 # security cookie checks may perform non-zeroing XORs, these are expected within a certain
@@ -177,7 +181,7 @@ def extract_insn_number_features(f, bb, insn):
             # assume its not also a constant.
             continue
 
-        if insn.mnem == "add" and insn.opers[0].isReg() and insn.opers[0].reg == envi.archs.i386.disasm.REG_ESP:
+        if insn.mnem == "add" and insn.opers[0].isReg() and insn.opers[0].reg == envi.archs.i386.regs.REG_ESP:
             # skip things like:
             #
             #    .text:00401140                 call    sub_407E2B
@@ -220,7 +224,7 @@ def derefs(vw, p):
         p = next
 
 
-def read_memory(vw, va, size):
+def read_memory(vw, va: int, size: int) -> bytes:
     # as documented in #176, vivisect will not readMemory() when the section is not marked readable.
     #
     # but here, we don't care about permissions.
@@ -233,10 +237,10 @@ def read_memory(vw, va, size):
             mva, msize, mperms, mfname = mmap
             offset = va - mva
             return mbytes[offset : offset + size]
-    raise envi.SegmentationViolation(va)
+    raise envi.exc.SegmentationViolation(va)
 
 
-def read_bytes(vw, va):
+def read_bytes(vw, va: int) -> bytes:
     """
     read up to MAX_BYTES_FEATURE_SIZE from the given address.
 
@@ -245,7 +249,7 @@ def read_bytes(vw, va):
     """
     segm = vw.getSegment(va)
     if not segm:
-        raise envi.SegmentationViolation(va)
+        raise envi.exc.SegmentationViolation(va)
 
     segm_end = segm[0] + segm[1]
     try:
@@ -254,7 +258,7 @@ def read_bytes(vw, va):
             return read_memory(vw, va, segm_end - va)
         else:
             return read_memory(vw, va, MAX_BYTES_FEATURE_SIZE)
-    except envi.SegmentationViolation:
+    except envi.exc.SegmentationViolation:
         raise
 
 
@@ -286,7 +290,7 @@ def extract_insn_bytes_features(f, bb, insn):
         for v in derefs(f.vw, v):
             try:
                 buf = read_bytes(f.vw, v)
-            except envi.SegmentationViolation:
+            except envi.exc.SegmentationViolation:
                 continue
 
             if capa.features.extractors.helpers.all_zeros(buf):
@@ -295,10 +299,10 @@ def extract_insn_bytes_features(f, bb, insn):
             yield Bytes(buf), insn.va
 
 
-def read_string(vw, offset):
+def read_string(vw, offset: int) -> str:
     try:
         alen = vw.detectString(offset)
-    except envi.SegmentationViolation:
+    except envi.exc.SegmentationViolation:
         pass
     else:
         if alen > 0:
@@ -306,7 +310,7 @@ def read_string(vw, offset):
 
     try:
         ulen = vw.detectUnicode(offset)
-    except envi.SegmentationViolation:
+    except envi.exc.SegmentationViolation:
         pass
     except IndexError:
         # potential vivisect bug detecting Unicode at segment end
@@ -367,14 +371,14 @@ def extract_insn_offset_features(f, bb, insn):
         #       reg   ^
         #             disp
         if isinstance(oper, envi.archs.i386.disasm.i386RegMemOper):
-            if oper.reg == envi.archs.i386.disasm.REG_ESP:
+            if oper.reg == envi.archs.i386.regs.REG_ESP:
                 continue
 
-            if oper.reg == envi.archs.i386.disasm.REG_EBP:
+            if oper.reg == envi.archs.i386.regs.REG_EBP:
                 continue
 
             # TODO: do x64 support for real.
-            if oper.reg == envi.archs.amd64.disasm.REG_RBP:
+            if oper.reg == envi.archs.amd64.regs.REG_RBP:
                 continue
 
             # viv already decodes offsets as signed
@@ -395,18 +399,18 @@ def extract_insn_offset_features(f, bb, insn):
             yield Offset(v, arch=get_arch(f.vw)), insn.va
 
 
-def is_security_cookie(f, bb, insn):
+def is_security_cookie(f, bb, insn) -> bool:
     """
     check if an instruction is related to security cookie checks
     """
     # security cookie check should use SP or BP
     oper = insn.opers[1]
     if oper.isReg() and oper.reg not in [
-        envi.archs.i386.disasm.REG_ESP,
-        envi.archs.i386.disasm.REG_EBP,
+        envi.archs.i386.regs.REG_ESP,
+        envi.archs.i386.regs.REG_EBP,
         # TODO: do x64 support for real.
-        envi.archs.amd64.disasm.REG_RBP,
-        envi.archs.amd64.disasm.REG_RSP,
+        envi.archs.amd64.regs.REG_RBP,
+        envi.archs.amd64.regs.REG_RSP,
     ]:
         return False
 
@@ -492,7 +496,7 @@ def extract_insn_segment_access_features(f, bb, insn):
         yield Characteristic("gs access"), insn.va
 
 
-def get_section(vw, va):
+def get_section(vw, va: int):
     for start, length, _, __ in vw.getMemoryMaps():
         if start <= va < start + length:
             return start
@@ -603,7 +607,7 @@ def extract_features(f, bb, insn):
       insn (vivisect...Instruction): the instruction to process.
 
     yields:
-      Feature, set[VA]: the features and their location found in this insn.
+      Tuple[Feature, int]: the features and their location found in this insn.
     """
     for insn_handler in INSTRUCTION_HANDLERS:
         for feature, va in insn_handler(f, bb, insn):

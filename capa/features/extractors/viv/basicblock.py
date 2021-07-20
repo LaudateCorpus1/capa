@@ -10,9 +10,9 @@ import string
 import struct
 
 import envi
-import vivisect.const
+import envi.archs.i386.disasm
 
-from capa.features import Characteristic
+from capa.features.common import Characteristic
 from capa.features.basicblock import BasicBlock
 from capa.features.extractors.helpers import MIN_STACKSTRING_LEN
 
@@ -37,7 +37,7 @@ def _bb_has_tight_loop(f, bb):
     """
     if len(bb.instructions) > 0:
         for bva, bflags in bb.instructions[-1].getBranches():
-            if bflags & vivisect.envi.BR_COND:
+            if bflags & envi.BR_COND:
                 if bva == bb.va:
                     return True
 
@@ -73,7 +73,7 @@ def extract_stackstring(f, bb):
         yield Characteristic("stack string"), bb.va
 
 
-def is_mov_imm_to_stack(instr):
+def is_mov_imm_to_stack(instr: envi.archs.i386.disasm.i386Opcode) -> bool:
     """
     Return if instruction moves immediate onto stack
     """
@@ -105,7 +105,7 @@ def is_mov_imm_to_stack(instr):
     return True
 
 
-def get_printable_len(oper):
+def get_printable_len(oper: envi.archs.i386.disasm.i386ImmOper) -> int:
     """
     Return string length if all operand bytes are ascii or utf16-le printable
     """
@@ -117,14 +117,18 @@ def get_printable_len(oper):
         chars = struct.pack("<I", oper.imm)
     elif oper.tsize == 8:
         chars = struct.pack("<Q", oper.imm)
+    else:
+        raise ValueError("unexpected oper.tsize: %d" % (oper.tsize))
+
     if is_printable_ascii(chars):
         return oper.tsize
-    if is_printable_utf16le(chars):
+    elif is_printable_utf16le(chars):
         return oper.tsize / 2
-    return 0
+    else:
+        return 0
 
 
-def is_printable_ascii(chars):
+def is_printable_ascii(chars: bytes) -> bool:
     try:
         chars_str = chars.decode("ascii")
     except UnicodeDecodeError:
@@ -133,9 +137,10 @@ def is_printable_ascii(chars):
         return all(c in string.printable for c in chars_str)
 
 
-def is_printable_utf16le(chars):
+def is_printable_utf16le(chars: bytes) -> bool:
     if all(c == b"\x00" for c in chars[1::2]):
         return is_printable_ascii(chars[::2])
+    return False
 
 
 def extract_features(f, bb):
@@ -147,7 +152,7 @@ def extract_features(f, bb):
       bb (viv_utils.BasicBlock): the basic block to process.
 
     yields:
-      Feature, set[VA]: the features and their location found in this basic block.
+      Tuple[Feature, int]: the features and their location found in this basic block.
     """
     yield BasicBlock(), bb.va
     for bb_handler in BASIC_BLOCK_HANDLERS:

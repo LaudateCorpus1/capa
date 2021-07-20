@@ -6,18 +6,18 @@ import collections
 import capa.main
 import capa.rules
 import capa.engine
-import capa.render
 import capa.features
+import capa.render.json
 import capa.render.utils as rutils
+import capa.render.default
+import capa.render.result_document
 from capa.engine import *
-from capa.render import convert_capabilities_to_result_document
 
 # edit this to set the path for file to analyze and rule directory
 RULES_PATH = "/tmp/capa/rules/"
 
 # load rules from disk
-rules = capa.main.get_rules(RULES_PATH, disable_progress=True)
-rules = capa.rules.RuleSet(rules)
+rules = capa.rules.RuleSet(capa.main.get_rules(RULES_PATH, disable_progress=True))
 
 # == Render ddictionary helpers
 def render_meta(doc, ostream):
@@ -192,7 +192,7 @@ def render_dictionary(doc):
 def capa_details(file_path, output_format="dictionary"):
 
     # extract features and find capabilities
-    extractor = capa.main.get_extractor(file_path, "auto", capa.main.BACKEND_VIV, sigpaths=[], disable_progress=True)
+    extractor = capa.main.get_extractor(file_path, "auto", capa.main.BACKEND_VIV, [], False, disable_progress=True)
     capabilities, counts = capa.main.find_capabilities(rules, extractor, disable_progress=True)
 
     # collect metadata (used only to make rendering more complete)
@@ -202,14 +202,14 @@ def capa_details(file_path, output_format="dictionary"):
     capa_output = False
     if output_format == "dictionary":
         # ...as python dictionary, simplified as textable but in dictionary
-        doc = convert_capabilities_to_result_document(meta, rules, capabilities)
+        doc = capa.render.result_document.convert_capabilities_to_result_document(meta, rules, capabilities)
         capa_output = render_dictionary(doc)
     elif output_format == "json":
         # render results
         # ...as json
-        capa_output = json.loads(capa.render.render_json(meta, rules, capabilities))
+        capa_output = json.loads(capa.render.json.render(meta, rules, capabilities))
     elif output_format == "texttable":
         # ...as human readable text table
-        capa_output = capa.render.render_default(meta, rules, capabilities)
+        capa_output = capa.render.default.render(meta, rules, capabilities)
 
     return capa_output

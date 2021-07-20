@@ -6,11 +6,12 @@
 #  is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
 
-from capa.features import Feature
+import capa.render.utils
+from capa.features.common import Feature
 
 
 class API(Feature):
-    def __init__(self, name, description=None):
+    def __init__(self, name: str, description=None):
         # Downcase library name if given
         if "." in name:
             modname, _, impname = name.rpartition(".")
@@ -20,21 +21,21 @@ class API(Feature):
 
 
 class Number(Feature):
-    def __init__(self, value, arch=None, description=None):
+    def __init__(self, value: int, arch=None, description=None):
         super(Number, self).__init__(value, arch=arch, description=description)
 
     def get_value_str(self):
-        return "0x%X" % self.value
+        return capa.render.utils.hex(self.value)
 
 
 class Offset(Feature):
-    def __init__(self, value, arch=None, description=None):
+    def __init__(self, value: int, arch=None, description=None):
         super(Offset, self).__init__(value, arch=arch, description=description)
 
     def get_value_str(self):
-        return "0x%X" % self.value
+        return capa.render.utils.hex(self.value)
 
 
 class Mnemonic(Feature):
-    def __init__(self, value, description=None):
+    def __init__(self, value: str, description=None):
         super(Mnemonic, self).__init__(value, description=description)
