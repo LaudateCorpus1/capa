@@ -4,15 +4,29 @@
 
 ### New Features
 
+- explorer: allow user to add specified number of bytes when adding a Bytes feature in the Rule Generator #689 @mike-hunhoff
+- explorer: enforce max column width Features and Editor panes #691 @mike-hunhoff
+- explorer: add option to limit features to currently selected disassembly address #692 @mike-hunhoff
+
 ### Breaking Changes
 
-### New Rules (0)
+### New Rules (6)
 
-- 
+- collection/webcam/capture-webcam-image johnk3r
+- nursery/list-drag-and-drop-files michael.hunhoff@fireeye.com
+- nursery/monitor-clipboard-content michael.hunhoff@fireeye.com
+- nursery/monitor-local-ipv4-address-changes michael.hunhoff@fireeye.com
+- nursery/load-windows-common-language-runtime michael.hunhoff@fireeye.com
+- nursery/resize-volume-shadow-copy-storage michael.hunhoff@fireeye.com
+-
 
 ### Bug Fixes
 
 ### capa explorer IDA Pro plugin
+
+- explorer: add additional filter logic when displaying matches by function #686 @mike-hunhoff
+- explorer: remove duplicate check when saving file #687 @mike-hunhoff
+- explorer: update IDA extractor to use non-canon mnemonics #688 @mike-hunhoff
 
 ### Development
 
